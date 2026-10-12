@@ -55,6 +55,49 @@ func (ns NullChannelHealth) Value() (driver.Value, error) {
 	return string(ns.ChannelHealth), nil
 }
 
+type CopyOperationState string
+
+const (
+	CopyOperationStatePartsPending CopyOperationState = "parts_pending"
+	CopyOperationStatePublished    CopyOperationState = "published"
+	CopyOperationStateAborted      CopyOperationState = "aborted"
+)
+
+func (e *CopyOperationState) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = CopyOperationState(s)
+	case string:
+		*e = CopyOperationState(s)
+	default:
+		return fmt.Errorf("unsupported scan type for CopyOperationState: %T", src)
+	}
+	return nil
+}
+
+type NullCopyOperationState struct {
+	CopyOperationState CopyOperationState `json:"copy_operation_state"`
+	Valid              bool               `json:"valid"` // Valid is true if CopyOperationState is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullCopyOperationState) Scan(value interface{}) error {
+	if value == nil {
+		ns.CopyOperationState, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.CopyOperationState.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullCopyOperationState) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.CopyOperationState), nil
+}
+
 type FileKind string
 
 const (
@@ -453,6 +496,40 @@ type Channel struct {
 	LastCheckedAt pgtype.Timestamptz `json:"last_checked_at"`
 	CreatedAt     pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
+}
+
+type CopyOperation struct {
+	ID             pgtype.UUID        `json:"id"`
+	UserID         int64              `json:"user_id"`
+	SourceRootID   pgtype.UUID        `json:"source_root_id"`
+	TargetParentID pgtype.UUID        `json:"target_parent_id"`
+	RequestedName  pgtype.Text        `json:"requested_name"`
+	ConflictPolicy NameConflictPolicy `json:"conflict_policy"`
+	TreeSnapshot   []byte             `json:"tree_snapshot"`
+	State          CopyOperationState `json:"state"`
+	ResultRootID   pgtype.UUID        `json:"result_root_id"`
+	LastError      pgtype.Text        `json:"last_error"`
+	ExpiresAt      pgtype.Timestamptz `json:"expires_at"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
+	PublishedAt    pgtype.Timestamptz `json:"published_at"`
+}
+
+type CopyOperationPart struct {
+	OperationID     pgtype.UUID        `json:"operation_id"`
+	SourceFileID    pgtype.UUID        `json:"source_file_id"`
+	PartNo          int32              `json:"part_no"`
+	SourceChannelID int64              `json:"source_channel_id"`
+	SourceMessageID int64              `json:"source_message_id"`
+	DestChannelID   int64              `json:"dest_channel_id"`
+	DestMessageID   pgtype.Int8        `json:"dest_message_id"`
+	PlainSize       pgtype.Int8        `json:"plain_size"`
+	StoredSize      pgtype.Int8        `json:"stored_size"`
+	Checksum        pgtype.Text        `json:"checksum"`
+	Salt            pgtype.Text        `json:"salt"`
+	BlockHashes     []byte             `json:"block_hashes"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	CopiedAt        pgtype.Timestamptz `json:"copied_at"`
 }
 
 type EventStreamTicket struct {

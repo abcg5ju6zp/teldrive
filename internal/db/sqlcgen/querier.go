@@ -20,9 +20,13 @@ type Querier interface {
 	ClaimUploadPart(ctx context.Context, arg ClaimUploadPartParams) (*UploadPart, error)
 	ClearSelectedChannel(ctx context.Context, userID int64) error
 	ClearUploadSessionParentsByFileIDs(ctx context.Context, arg ClearUploadSessionParentsByFileIDsParams) error
+	CompleteCopyOperation(ctx context.Context, arg CompleteCopyOperationParams) (int64, error)
 	CompleteIdempotencyKey(ctx context.Context, arg CompleteIdempotencyKeyParams) (*IdempotencyKey, error)
 	CompleteTelegramLoginFlow(ctx context.Context, id pgtype.UUID) (*TelegramLoginFlow, error)
 	CompleteUploadSession(ctx context.Context, arg CompleteUploadSessionParams) (*UploadSession, error)
+	// A confirmed receipt also heartbeats the operation, which lets recovery
+	// distinguish a long but alive copy from a crashed one.
+	ConfirmCopyPart(ctx context.Context, arg ConfirmCopyPartParams) error
 	CountBookmarkableFiles(ctx context.Context, arg CountBookmarkableFilesParams) (int32, error)
 	CountChannelReferences(ctx context.Context, targetChannelID int64) (int64, error)
 	CountChannelStoredMessages(ctx context.Context, targetChannelID int64) (int64, error)
@@ -38,6 +42,7 @@ type Querier interface {
 	CreateUploadSession(ctx context.Context, arg CreateUploadSessionParams) (*UploadSession, error)
 	DeleteBot(ctx context.Context, arg DeleteBotParams) (int64, error)
 	DeleteChannel(ctx context.Context, arg DeleteChannelParams) (int64, error)
+	DeleteExpiredCopyOperations(ctx context.Context) (int64, error)
 	DeleteExpiredEventStreamTickets(ctx context.Context) (int64, error)
 	DeleteExpiredIdempotencyKeys(ctx context.Context) (int64, error)
 	DeleteExpiredTelegramLoginFlows(ctx context.Context) (int64, error)
@@ -57,6 +62,7 @@ type Querier interface {
 	GetAllUploadPartSummary(ctx context.Context, uploadID pgtype.UUID) (*GetAllUploadPartSummaryRow, error)
 	GetBot(ctx context.Context, arg GetBotParams) (*Bot, error)
 	GetChannelForUser(ctx context.Context, arg GetChannelForUserParams) (*Channel, error)
+	GetCopyOperation(ctx context.Context, id pgtype.UUID) (*CopyOperation, error)
 	GetDriveStatistics(ctx context.Context, userID int64) (*GetDriveStatisticsRow, error)
 	GetEventStreamTicketUser(ctx context.Context, tokenHash []byte) (int64, error)
 	GetFileAccessGrantForOwner(ctx context.Context, arg GetFileAccessGrantForOwnerParams) (*FileAccessGrant, error)
@@ -81,6 +87,8 @@ type Querier interface {
 	InsertAuditEvent(ctx context.Context, arg InsertAuditEventParams) (*AuditEvent, error)
 	InsertCopiedFileParts(ctx context.Context, parts []byte) (int64, error)
 	InsertCopiedFiles(ctx context.Context, files []byte) ([]*File, error)
+	InsertCopyOperation(ctx context.Context, arg InsertCopyOperationParams) (*CopyOperation, error)
+	InsertCopyOperationParts(ctx context.Context, arg InsertCopyOperationPartsParams) (int64, error)
 	InsertFileFromUpload(ctx context.Context, arg InsertFileFromUploadParams) (*File, error)
 	InsertFilePartsFromUpload(ctx context.Context, arg InsertFilePartsFromUploadParams) (int64, error)
 	InsertPendingBots(ctx context.Context, arg InsertPendingBotsParams) ([]*Bot, error)
@@ -94,6 +102,8 @@ type Querier interface {
 	ListChannelReferencedParts(ctx context.Context, arg ListChannelReferencedPartsParams) ([]*ListChannelReferencedPartsRow, error)
 	ListChannels(ctx context.Context, arg ListChannelsParams) ([]*Channel, error)
 	ListChannelsForOrphanCleanup(ctx context.Context) ([]*Channel, error)
+	ListCopyOperationParts(ctx context.Context, operationID pgtype.UUID) ([]*CopyOperationPart, error)
+	ListCopyPartReceipts(ctx context.Context, operationID pgtype.UUID) ([]*ListCopyPartReceiptsRow, error)
 	ListDeletionPendingRoots(ctx context.Context) ([]*ListDeletionPendingRootsRow, error)
 	ListEnabledBots(ctx context.Context, userID int64) ([]*Bot, error)
 	ListFileAccessGrantsForOwner(ctx context.Context, arg ListFileAccessGrantsForOwnerParams) ([]*ListFileAccessGrantsForOwnerRow, error)
@@ -108,11 +118,15 @@ type Querier interface {
 	ListFileSubtreeIDs(ctx context.Context, arg ListFileSubtreeIDsParams) ([]pgtype.UUID, error)
 	ListFiles(ctx context.Context, arg ListFilesParams) ([]*File, error)
 	ListFilesAdvanced(ctx context.Context, arg ListFilesAdvancedParams) ([]*File, error)
+	// Messages held by other live operations are off-limits for compensation:
+	// Telegram may have reused the same numeric message id after deletion.
+	ListOtherCopyPartMessageClaims(ctx context.Context, arg ListOtherCopyPartMessageClaimsParams) ([]pgtype.Int8, error)
 	ListRecentStorageActivity(ctx context.Context, arg ListRecentStorageActivityParams) ([]*ListRecentStorageActivityRow, error)
 	ListReferencedMessageIDs(ctx context.Context, arg ListReferencedMessageIDsParams) ([]int64, error)
 	ListSessions(ctx context.Context, arg ListSessionsParams) ([]*Session, error)
 	ListShared(ctx context.Context, arg ListSharedParams) ([]*File, error)
 	ListSharedWithMe(ctx context.Context, arg ListSharedWithMeParams) ([]*ListSharedWithMeRow, error)
+	ListStaleCopyOperations(ctx context.Context, arg ListStaleCopyOperationsParams) ([]*CopyOperation, error)
 	ListStorageChannelStatistics(ctx context.Context, userID int64) ([]*ListStorageChannelStatisticsRow, error)
 	ListStorageGrowth(ctx context.Context, userID int64) ([]*ListStorageGrowthRow, error)
 	ListStoredUploadPartHashes(ctx context.Context, uploadID pgtype.UUID) ([][]byte, error)
@@ -138,6 +152,9 @@ type Querier interface {
 	MarkBotProvisionFailure(ctx context.Context, arg MarkBotProvisionFailureParams) (int64, error)
 	MarkBotUploadFailure(ctx context.Context, arg MarkBotUploadFailureParams) (int64, error)
 	MarkBotUploadSuccess(ctx context.Context, arg MarkBotUploadSuccessParams) (int64, error)
+	// Only an unfinished operation can become aborted; a published operation is
+	// immutable so late compensation can never undo a committed catalog tree.
+	MarkCopyOperationAborted(ctx context.Context, arg MarkCopyOperationAbortedParams) (int64, error)
 	MarkFileDeletionPending(ctx context.Context, arg MarkFileDeletionPendingParams) (*File, error)
 	MarkFileIDsDeletionPending(ctx context.Context, arg MarkFileIDsDeletionPendingParams) error
 	MarkFileSubtreeDeletionPending(ctx context.Context, arg MarkFileSubtreeDeletionPendingParams) error
@@ -149,6 +166,7 @@ type Querier interface {
 	MoveFilesWithNames(ctx context.Context, arg MoveFilesWithNamesParams) ([]*File, error)
 	NextBotSelectionValue(ctx context.Context, arg NextBotSelectionValueParams) (int64, error)
 	QueueFileSubtreePurge(ctx context.Context, arg QueueFileSubtreePurgeParams) ([]*File, error)
+	RecordCopyOperationError(ctx context.Context, arg RecordCopyOperationErrorParams) error
 	ReleaseAdvisoryLock(ctx context.Context, lockID int64) (bool, error)
 	RemoveFileBookmarks(ctx context.Context, arg RemoveFileBookmarksParams) error
 	RenameUploadSession(ctx context.Context, arg RenameUploadSessionParams) (int64, error)

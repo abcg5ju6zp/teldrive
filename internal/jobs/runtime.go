@@ -31,12 +31,14 @@ const (
 	trashCleanupPeriodicID            = "teldrive-trash-cleanup"
 	purgePeriodicID                   = "teldrive-pending-file-purge"
 	orphanCleanupPeriodicID           = "teldrive-orphaned-telegram-part-cleanup"
+	copyRecoveryPeriodicID            = "teldrive-pending-copy-recovery"
 	uploadCleanupDefaultCron          = "@every 12h"
 	eventCleanupDefaultCron           = "0 0 * * *"
 	eventCleanupDefaultRetention      = "48h"
 	trashCleanupDefaultCron           = "@every 12h"
 	pendingDeletionCleanupDefaultCron = "@every 12h"
 	orphanCleanupDefaultCron          = "@every 336h"
+	copyRecoveryDefaultCron           = "@every 10m"
 	maintenanceTimezone               = "UTC"
 	maintenanceWorkers                = 2
 	cleanupPeriodicID                 = uploadCleanupPeriodicID // deprecated compatibility name
@@ -50,6 +52,7 @@ type Runtime struct {
 	schema               string
 	purgeEnabled         bool
 	orphanCleanupEnabled bool
+	copyRecoveryEnabled  bool
 	botProvisionEnabled  bool
 	uploadEnabled        bool
 	mu                   sync.Mutex
@@ -97,12 +100,19 @@ func newRuntimeWithSchema(pool *pgxpool.Pool, storage telegramstore.Storage, sch
 	if len(purgeServices) > 0 {
 		purgeService = purgeServices[0]
 	}
+	copyRecoveryEnabled := false
 	if purgeService != nil {
 		if err := river.AddWorkerSafely(workers, NewPendingFilePurgeWorker(pool, purgeService)); err != nil {
 			return nil, fmt.Errorf("register purge worker: %w", err)
 		}
 		if err := river.AddWorkerSafely(workers, NewTrashCleanupWorker(pool, purgeService)); err != nil {
 			return nil, fmt.Errorf("register trash cleanup worker: %w", err)
+		}
+		if recovery, ok := purgeService.(CopyRecoveryService); ok {
+			if err := river.AddWorkerSafely(workers, NewPendingCopyRecoveryWorker(recovery)); err != nil {
+				return nil, fmt.Errorf("register copy recovery worker: %w", err)
+			}
+			copyRecoveryEnabled = true
 		}
 	}
 	lister, orphanCleanupEnabled := storage.(telegramstore.DocumentMessageLister)
@@ -161,7 +171,8 @@ func newRuntimeWithSchema(pool *pgxpool.Pool, storage telegramstore.Storage, sch
 	}
 	return &Runtime{
 		client: client, pool: pool, schema: schema,
-		purgeEnabled: purgeService != nil, orphanCleanupEnabled: orphanCleanupEnabled, botProvisionEnabled: botProvisionEnabled, uploadEnabled: uploadEnabled,
+		purgeEnabled: purgeService != nil, orphanCleanupEnabled: orphanCleanupEnabled,
+		copyRecoveryEnabled: copyRecoveryEnabled, botProvisionEnabled: botProvisionEnabled, uploadEnabled: uploadEnabled,
 	}, nil
 }
 
@@ -247,6 +258,26 @@ func (r *Runtime) Start(ctx context.Context) error {
 			},
 		}); err != nil && !errors.Is(err, riverpro.ErrPeriodicJobAlreadyExists) {
 			return fmt.Errorf("upsert purge periodic job: %w", err)
+		}
+	}
+	if r.copyRecoveryEnabled {
+		copyRecoveryArgs, err := json.Marshal(CopyRecoverySweepArgs{})
+		if err != nil {
+			return fmt.Errorf("marshal copy recovery periodic args: %w", err)
+		}
+		if _, err := r.client.PeriodicJobInsert(ctx, &riverpro.PeriodicJobInsertOpts{
+			ID:          copyRecoveryPeriodicID,
+			Kind:        CopyRecoveryKind,
+			Args:        copyRecoveryArgs,
+			Queue:       CopyRecoveryQueue,
+			Priority:    2,
+			MaxAttempts: 3,
+			Schedule: &riverpro.PeriodicJobSchedule{
+				CronExpression: copyRecoveryDefaultCron,
+				CronTimezone:   maintenanceTimezone,
+			},
+		}); err != nil && !errors.Is(err, riverpro.ErrPeriodicJobAlreadyExists) {
+			return fmt.Errorf("upsert copy recovery periodic job: %w", err)
 		}
 	}
 	if r.orphanCleanupEnabled {
