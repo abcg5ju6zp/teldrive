@@ -17,12 +17,20 @@ type Querier interface {
 	AcquireUserBootstrapLock(ctx context.Context) error
 	ActivateBot(ctx context.Context, arg ActivateBotParams) (*Bot, error)
 	AddFileBookmarks(ctx context.Context, arg AddFileBookmarksParams) error
+	// Commits the stored part and its remote-message receipt in one transaction.
+	// The receipt may still be 'pending' for direct StorePart callers; after a
+	// normal publish it is 'published'. The receipt owns the encryption salt once
+	// a message has been published.
+	AdoptStoredPart(ctx context.Context, arg AdoptStoredPartParams) (*AdoptStoredPartRow, error)
+	AttachPartReceiptHashes(ctx context.Context, arg AttachPartReceiptHashesParams) (int64, error)
 	ClaimUploadPart(ctx context.Context, arg ClaimUploadPartParams) (*UploadPart, error)
+	ClaimUploadPartOnReceipt(ctx context.Context, arg ClaimUploadPartOnReceiptParams) (*UploadPart, error)
 	ClearSelectedChannel(ctx context.Context, userID int64) error
 	ClearUploadSessionParentsByFileIDs(ctx context.Context, arg ClearUploadSessionParentsByFileIDsParams) error
 	CompleteIdempotencyKey(ctx context.Context, arg CompleteIdempotencyKeyParams) (*IdempotencyKey, error)
 	CompleteTelegramLoginFlow(ctx context.Context, id pgtype.UUID) (*TelegramLoginFlow, error)
 	CompleteUploadSession(ctx context.Context, arg CompleteUploadSessionParams) (*UploadSession, error)
+	CondemnPartReceipt(ctx context.Context, arg CondemnPartReceiptParams) (int64, error)
 	CountBookmarkableFiles(ctx context.Context, arg CountBookmarkableFilesParams) (int32, error)
 	CountChannelReferences(ctx context.Context, targetChannelID int64) (int64, error)
 	CountChannelStoredMessages(ctx context.Context, targetChannelID int64) (int64, error)
@@ -36,19 +44,32 @@ type Querier interface {
 	CreateSession(ctx context.Context, arg CreateSessionParams) (*Session, error)
 	CreateTelegramLoginFlow(ctx context.Context, arg CreateTelegramLoginFlowParams) (*TelegramLoginFlow, error)
 	CreateUploadSession(ctx context.Context, arg CreateUploadSessionParams) (*UploadSession, error)
+	// Committed-class row garbage collection: adopted receipts never require a
+	// remote delete. They are removed once the file is committed (file_parts is
+	// the durable reference) or their stored part row has already been cleaned.
+	DeleteAdoptedReceipts(ctx context.Context) (int64, error)
 	DeleteBot(ctx context.Context, arg DeleteBotParams) (int64, error)
 	DeleteChannel(ctx context.Context, arg DeleteChannelParams) (int64, error)
+	DeleteCondemnedReceiptsForCleanup(ctx context.Context, receipts []byte) (int64, error)
+	// Not-yet-published class: drop intent rows whose lease is dead. No remote
+	// message exists for these receipts, so no Telegram call is involved.
+	DeleteDeadPendingReceipts(ctx context.Context) (int64, error)
 	DeleteExpiredEventStreamTickets(ctx context.Context) (int64, error)
 	DeleteExpiredIdempotencyKeys(ctx context.Context) (int64, error)
 	DeleteExpiredTelegramLoginFlows(ctx context.Context) (int64, error)
 	DeleteFileCatalogRowsByIDs(ctx context.Context, arg DeleteFileCatalogRowsByIDsParams) (int64, error)
 	DeleteFilePartsByFileIDs(ctx context.Context, fileIds []pgtype.UUID) error
 	DeleteFileViewState(ctx context.Context, arg DeleteFileViewStateParams) (int64, error)
+	DeletePartReceipt(ctx context.Context, arg DeletePartReceiptParams) error
+	DeletePartReceiptByLease(ctx context.Context, arg DeletePartReceiptByLeaseParams) error
+	DeleteSupersededReceiptsForCleanup(ctx context.Context, receipts []byte) (int64, error)
+	DeleteUploadPartReceiptsForCleanup(ctx context.Context, receipts []byte) (int64, error)
 	DeleteUploadPartsForCleanup(ctx context.Context, parts []byte) (int64, error)
 	DeleteUserEventsBefore(ctx context.Context, cutoff pgtype.Timestamptz) (int64, error)
 	ExpireUploadSessions(ctx context.Context) ([]*UploadSession, error)
 	FinalizeUploadExpectedSize(ctx context.Context, arg FinalizeUploadExpectedSizeParams) (*UploadSession, error)
 	FindResumableUploadSessions(ctx context.Context, arg FindResumableUploadSessionsParams) ([]*UploadSession, error)
+	FindTakeablePartReceipt(ctx context.Context, arg FindTakeablePartReceiptParams) (*UploadPartReceipt, error)
 	GetActiveAPIKeyByHash(ctx context.Context, secretHash []byte) (*ApiKey, error)
 	GetActiveFileAnyOwner(ctx context.Context, fileID pgtype.UUID) (*File, error)
 	GetActiveFolderForUser(ctx context.Context, arg GetActiveFolderForUserParams) (*File, error)
@@ -83,7 +104,14 @@ type Querier interface {
 	InsertCopiedFiles(ctx context.Context, files []byte) ([]*File, error)
 	InsertFileFromUpload(ctx context.Context, arg InsertFileFromUploadParams) (*File, error)
 	InsertFilePartsFromUpload(ctx context.Context, arg InsertFilePartsFromUploadParams) (int64, error)
+	// --------------------------------------------------------------------------
+	// Remote message receipts: durable record of Telegram messages published for
+	// an upload attempt, enabling publish-once retries and three-class cleanup
+	// (not published / committed / safe to delete).
+	// --------------------------------------------------------------------------
+	InsertPartReceipt(ctx context.Context, arg InsertPartReceiptParams) error
 	InsertPendingBots(ctx context.Context, arg InsertPendingBotsParams) ([]*Bot, error)
+	InsertTakeoverReceipt(ctx context.Context, arg InsertTakeoverReceiptParams) error
 	InsertUserEvent(ctx context.Context, arg InsertUserEventParams) (*UserEvent, error)
 	ListAPIKeys(ctx context.Context, arg ListAPIKeysParams) ([]*ApiKey, error)
 	ListActiveFileIDsAnyOwner(ctx context.Context, fileIds []pgtype.UUID) ([]pgtype.UUID, error)
@@ -94,6 +122,9 @@ type Querier interface {
 	ListChannelReferencedParts(ctx context.Context, arg ListChannelReferencedPartsParams) ([]*ListChannelReferencedPartsRow, error)
 	ListChannels(ctx context.Context, arg ListChannelsParams) ([]*Channel, error)
 	ListChannelsForOrphanCleanup(ctx context.Context) ([]*Channel, error)
+	// Condemned messages can belong to still-open sessions (validation failures or
+	// lost leases), so they are swept independently of session state.
+	ListCondemnedReceiptsForCleanup(ctx context.Context) ([]*ListCondemnedReceiptsForCleanupRow, error)
 	ListDeletionPendingRoots(ctx context.Context) ([]*ListDeletionPendingRootsRow, error)
 	ListEnabledBots(ctx context.Context, userID int64) ([]*Bot, error)
 	ListFileAccessGrantsForOwner(ctx context.Context, arg ListFileAccessGrantsForOwnerParams) ([]*ListFileAccessGrantsForOwnerRow, error)
@@ -116,9 +147,15 @@ type Querier interface {
 	ListStorageChannelStatistics(ctx context.Context, userID int64) ([]*ListStorageChannelStatisticsRow, error)
 	ListStorageGrowth(ctx context.Context, userID int64) ([]*ListStorageGrowthRow, error)
 	ListStoredUploadPartHashes(ctx context.Context, uploadID pgtype.UUID) ([][]byte, error)
+	// Published receipts whose part committed a different message (duplicate
+	// publishes after lease takeover); their own message is unreferenced.
+	ListSupersededPublishedReceipts(ctx context.Context) ([]*ListSupersededPublishedReceiptsRow, error)
 	ListTrashedRootsBefore(ctx context.Context, deletedBefore pgtype.Timestamptz) ([]*ListTrashedRootsBeforeRow, error)
 	ListUploadDailyStatistics(ctx context.Context, arg ListUploadDailyStatisticsParams) ([]*ListUploadDailyStatisticsRow, error)
 	ListUploadEligibleBots(ctx context.Context, userID int64) ([]*Bot, error)
+	// Safe-to-delete receipts of aborted or expired sessions whose message is not
+	// referenced by any stored upload part or committed file part.
+	ListUploadPartReceiptsForCleanupMany(ctx context.Context, uploadIds []pgtype.UUID) ([]*ListUploadPartReceiptsForCleanupManyRow, error)
 	ListUploadParts(ctx context.Context, arg ListUploadPartsParams) ([]*UploadPart, error)
 	ListUploadPartsByUploadIDs(ctx context.Context, uploadIds []pgtype.UUID) ([]*UploadPart, error)
 	ListUploadPartsForCleanupMany(ctx context.Context, uploadIds []pgtype.UUID) ([]*UploadPart, error)
@@ -131,7 +168,9 @@ type Querier interface {
 	LockActiveDestinationEntries(ctx context.Context, arg LockActiveDestinationEntriesParams) ([]*LockActiveDestinationEntriesRow, error)
 	LockActiveFiles(ctx context.Context, arg LockActiveFilesParams) ([]*File, error)
 	LockActiveFolder(ctx context.Context, arg LockActiveFolderParams) (*File, error)
+	LockTakeablePartReceipt(ctx context.Context, arg LockTakeablePartReceiptParams) (*UploadPartReceipt, error)
 	LockUploadDestinationConflict(ctx context.Context, arg LockUploadDestinationConflictParams) (*File, error)
+	LockUploadPart(ctx context.Context, arg LockUploadPartParams) (*UploadPart, error)
 	LockUploadSessionForCompletion(ctx context.Context, arg LockUploadSessionForCompletionParams) (*UploadSession, error)
 	MarkActiveFileDeletionPendingForReplace(ctx context.Context, arg MarkActiveFileDeletionPendingForReplaceParams) (int64, error)
 	MarkAllTrashedDeletionPending(ctx context.Context, userID int64) (int64, error)
@@ -144,11 +183,11 @@ type Querier interface {
 	MarkFileSubtreesDeletionPending(ctx context.Context, arg MarkFileSubtreesDeletionPendingParams) error
 	MarkUploadCompleting(ctx context.Context, arg MarkUploadCompletingParams) (*UploadSession, error)
 	MarkUploadPartFailed(ctx context.Context, arg MarkUploadPartFailedParams) (*UploadPart, error)
-	MarkUploadPartStored(ctx context.Context, arg MarkUploadPartStoredParams) (*UploadPart, error)
 	MoveFile(ctx context.Context, arg MoveFileParams) (*File, error)
 	MoveFilesWithNames(ctx context.Context, arg MoveFilesWithNamesParams) ([]*File, error)
 	NextBotSelectionValue(ctx context.Context, arg NextBotSelectionValueParams) (int64, error)
 	QueueFileSubtreePurge(ctx context.Context, arg QueueFileSubtreePurgeParams) ([]*File, error)
+	RecordPartPublication(ctx context.Context, arg RecordPartPublicationParams) (*UploadPartReceipt, error)
 	ReleaseAdvisoryLock(ctx context.Context, lockID int64) (bool, error)
 	RemoveFileBookmarks(ctx context.Context, arg RemoveFileBookmarksParams) error
 	RenameUploadSession(ctx context.Context, arg RenameUploadSessionParams) (int64, error)

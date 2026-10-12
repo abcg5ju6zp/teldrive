@@ -40,6 +40,11 @@ type UploadCatalog interface {
 	Get(context.Context, int64, uuid.UUID) (*sqlcgen.UploadSession, error)
 	GetPart(context.Context, int64, uuid.UUID, int32) (*sqlcgen.UploadPart, error)
 	ClaimPart(context.Context, uploads.ClaimPartInput) (*uploads.ClaimPartResult, error)
+	FindTakeablePart(context.Context, uploads.FindTakeableInput) (*uploads.Adoption, error)
+	ClaimPartForAdoption(context.Context, uploads.ClaimAdoptionInput) (*uploads.ClaimPartResult, error)
+	RecordPartPublication(context.Context, uploads.RecordPublicationInput) error
+	CondemnPartReceipt(context.Context, uploads.CondemnPartReceiptInput) (int64, error)
+	DeletePartReceipt(context.Context, uploads.DeletePartReceiptInput) error
 	RenewPart(context.Context, uploads.RenewPartInput) error
 	StorePart(context.Context, uploads.StorePartInput) (*sqlcgen.UploadPart, error)
 	FailPart(context.Context, uploads.FailPartInput) (*sqlcgen.UploadPart, error)
@@ -125,11 +130,61 @@ func (p *Pipeline) UploadPart(ctx context.Context, request UploadPartRequest) (*
 	}
 	slog.DebugContext(ctx, "upload part started", "upload_id", request.UploadID, "part_no", request.PartNo, "plain_size", request.PlainSize, "requested_channel_id", request.RequestedChannelID)
 
+	// Recovery first: a published receipt from a dead lease is adopted without
+	// resolving a channel or publishing to Telegram again.
+	claim, err := p.claimPartForUpload(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	if claim.Existing {
+		return &UploadPartResult{Part: claim.Part, Existing: true}, nil
+	}
+
+	uploadCtx, cancelUpload := context.WithCancelCause(ctx)
+	defer cancelUpload(nil)
+	renewErrors := p.renewPartLease(uploadCtx, cancelUpload, request, claim.LeaseToken)
+
+	if claim.Adoption != nil {
+		return p.adoptPart(ctx, uploadCtx, session, request, claim, renewErrors)
+	}
+	return p.publishPart(ctx, uploadCtx, session, request, claim, renewErrors)
+}
+
+// claimPartForUpload adopts a takeable receipt when one exists, otherwise
+// reserves a fresh upload through the channel resolver.
+func (p *Pipeline) claimPartForUpload(ctx context.Context, request UploadPartRequest) (*uploads.ClaimPartResult, error) {
+	takeable, err := p.catalog.FindTakeablePart(ctx, uploads.FindTakeableInput{
+		UserID:    request.UserID,
+		UploadID:  request.UploadID,
+		PartNo:    request.PartNo,
+		PlainSize: request.PlainSize,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if takeable != nil {
+		claim, adoptErr := p.catalog.ClaimPartForAdoption(ctx, uploads.ClaimAdoptionInput{
+			UserID:    request.UserID,
+			UploadID:  request.UploadID,
+			PartNo:    request.PartNo,
+			PlainSize: request.PlainSize,
+			Checksum:  request.Checksum,
+		})
+		if adoptErr == nil {
+			slog.DebugContext(ctx, "adopting published upload part receipt", "upload_id", request.UploadID, "part_no", request.PartNo, "channel_id", takeable.ChannelID, "message_id", takeable.MessageID)
+			return claim, nil
+		}
+		if !errors.Is(adoptErr, uploads.ErrAdoptionUnavailable) {
+			return nil, adoptErr
+		}
+		// Lost the adoption race; fall through to a fresh claim.
+	}
+
 	channelID, err := p.channels.Resolve(ctx, request.UserID, request.RequestedChannelID)
 	if err != nil {
 		return nil, err
 	}
-	claim, err := p.catalog.ClaimPart(ctx, uploads.ClaimPartInput{
+	return p.catalog.ClaimPart(ctx, uploads.ClaimPartInput{
 		UserID:    request.UserID,
 		UploadID:  request.UploadID,
 		PartNo:    request.PartNo,
@@ -137,16 +192,13 @@ func (p *Pipeline) UploadPart(ctx context.Context, request UploadPartRequest) (*
 		PlainSize: request.PlainSize,
 		Checksum:  request.Checksum,
 	})
-	if err != nil {
-		return nil, err
-	}
-	if claim.Existing {
-		return &UploadPartResult{Part: claim.Part, Existing: true}, nil
-	}
-	uploadCtx, cancelUpload := context.WithCancelCause(ctx)
-	defer cancelUpload(nil)
-	renewErrors := p.renewPartLease(uploadCtx, cancelUpload, request, claim.LeaseToken)
+}
 
+// publishPart uploads new bytes to Telegram. The published message is recorded
+// on the durable receipt before any validation, so failed commits or dropped
+// responses never strand or double-publish the message.
+func (p *Pipeline) publishPart(ctx, uploadCtx context.Context, session *sqlcgen.UploadSession, request UploadPartRequest, claim *uploads.ClaimPartResult, renewErrors <-chan error) (*UploadPartResult, error) {
+	channelID := claim.Part.ChannelID
 	exact := newExactReader(uploadCtx, request.Body, request.PlainSize)
 	shouldHash := !p.config.DisableHashing || request.Checksum != nil || session.ExpectedHashAlgorithm.Valid
 	var hasher *treehash.BlockHasher
@@ -194,22 +246,37 @@ func (p *Pipeline) UploadPart(ctx context.Context, request UploadPartRequest) (*
 	})
 	slog.DebugContext(ctx, "uploading part to telegram", "upload_id", request.UploadID, "part_no", request.PartNo, "channel_id", channelID, "stored_size", storedSize, "threads", p.config.UploadThreads)
 	if err != nil {
-		if renewErr := pendingRenewError(renewErrors); renewErr != nil {
-			err = errors.Join(err, renewErr)
-		}
-		return nil, p.failPart(ctx, request, claim.LeaseToken, "telegram_upload_failed", err)
+		return nil, p.failPart(ctx, request, claim.LeaseToken, "telegram_upload_failed", errors.Join(err, pendingRenewError(renewErrors)))
+	}
+
+	// The message exists remotely from this point. Record it on the attempt's
+	// own receipt: this survives part-lease loss, request cancellation and
+	// ambiguous StorePart commits.
+	pubCtx, cancelPub := partCleanupContext(ctx)
+	pubErr := p.catalog.RecordPartPublication(pubCtx, uploads.RecordPublicationInput{
+		UploadID:   request.UploadID,
+		PartNo:     request.PartNo,
+		LeaseToken: claim.LeaseToken,
+		MessageID:  stored.MessageID,
+		StoredSize: stored.Size,
+		Salt:       salt,
+	})
+	cancelPub()
+	if pubErr != nil && errors.Is(pubErr, uploads.ErrLeaseLost) {
+		// The attempt no longer owns the part or its receipt. Its own message is
+		// referenced nowhere; best-effort remove it.
+		return nil, errors.Join(uploads.ErrLeaseLost, pendingRenewError(renewErrors), p.deleteUploaded(ctx, request.UserID, stored))
 	}
 	if renewErr := pendingRenewError(renewErrors); renewErr != nil {
-		cleanupErr := p.deleteUploaded(ctx, request.UserID, stored)
-		return nil, errors.Join(renewErr, cleanupErr)
+		// Receipt durably recorded under this token; a retry adopts it. Do not
+		// delete the message.
+		return nil, renewErr
 	}
 	if stored.ChannelID != channelID || stored.MessageID <= 0 || stored.Size != storedSize {
-		cleanupErr := p.deleteUploaded(ctx, request.UserID, stored)
-		return nil, p.failPart(ctx, request, claim.LeaseToken, "telegram_size_mismatch", errors.Join(ErrStoredSizeMismatch, cleanupErr))
+		return nil, p.rejectPublished(ctx, request, claim.LeaseToken, stored, "telegram_size_mismatch", ErrStoredSizeMismatch)
 	}
 	if err := exact.Verify(); err != nil {
-		cleanupErr := p.deleteUploaded(ctx, request.UserID, stored)
-		return nil, p.failPart(ctx, request, claim.LeaseToken, "body_size_mismatch", errors.Join(err, cleanupErr))
+		return nil, p.rejectPublished(ctx, request, claim.LeaseToken, stored, "body_size_mismatch", err)
 	}
 
 	var (
@@ -219,20 +286,16 @@ func (p *Pipeline) UploadPart(ctx context.Context, request UploadPartRequest) (*
 	if shouldHash {
 		blockHashes = hasher.Sum()
 		if len(blockHashes) == 0 || len(blockHashes)%treehash.DigestSize != 0 {
-			cleanupErr := p.deleteUploaded(ctx, request.UserID, stored)
-			return nil, p.failPart(ctx, request, claim.LeaseToken, "hash_generation_failed", errors.Join(ErrInvalidUpload, cleanupErr))
+			return nil, p.rejectPublished(ctx, request, claim.LeaseToken, stored, "hash_generation_failed", ErrInvalidUpload)
 		}
 		value := treehash.SumToHex(treehash.ComputeTreeHash(blockHashes))
 		actualChecksum = &value
 		if request.Checksum != nil && !strings.EqualFold(*request.Checksum, value) {
-			cleanupErr := p.deleteUploaded(ctx, request.UserID, stored)
-			return nil, p.failPart(ctx, request, claim.LeaseToken, "checksum_mismatch", errors.Join(ErrChecksumMismatch, cleanupErr))
+			return nil, p.rejectPublished(ctx, request, claim.LeaseToken, stored, "checksum_mismatch", ErrChecksumMismatch)
 		}
 	}
 
-	storeCtx, cancelStore := partCleanupContext(ctx)
-	defer cancelStore()
-	part, err := p.catalog.StorePart(storeCtx, uploads.StorePartInput{
+	part, err := p.commitPart(ctx, request, claim.LeaseToken, channelID, uploads.StorePartInput{
 		UploadID:    request.UploadID,
 		PartNo:      request.PartNo,
 		LeaseToken:  claim.LeaseToken,
@@ -243,11 +306,135 @@ func (p *Pipeline) UploadPart(ctx context.Context, request UploadPartRequest) (*
 		BlockHashes: append([]byte(nil), blockHashes...),
 	})
 	if err != nil {
-		cleanupErr := p.deleteUploaded(ctx, request.UserID, stored)
-		return nil, errors.Join(err, cleanupErr)
+		return nil, err
 	}
 	slog.DebugContext(ctx, "upload part completed", "upload_id", request.UploadID, "part_no", request.PartNo, "channel_id", stored.ChannelID, "message_id", stored.MessageID, "stored_size", stored.Size)
 	return &UploadPartResult{Part: part}, nil
+}
+
+// adoptPart verifies the re-streamed plaintext body against a published
+// receipt and commits the stored part without touching Telegram. The receipt
+// owns message identity, stored size and salt.
+func (p *Pipeline) adoptPart(ctx, uploadCtx context.Context, session *sqlcgen.UploadSession, request UploadPartRequest, claim *uploads.ClaimPartResult, renewErrors <-chan error) (*UploadPartResult, error) {
+	adoption := claim.Adoption
+	expectedStoredSize := request.PlainSize
+	if session.Encryption {
+		expectedStoredSize = contentcrypto.EncryptedSize(request.PlainSize)
+	}
+
+	exact := newExactReader(uploadCtx, request.Body, request.PlainSize)
+	shouldHash := !p.config.DisableHashing || request.Checksum != nil || session.ExpectedHashAlgorithm.Valid
+	reader := io.Reader(exact)
+	var hasher *treehash.BlockHasher
+	if shouldHash {
+		hasher = treehash.NewBlockHasher()
+		reader = io.TeeReader(exact, hasher)
+	}
+	if _, readErr := io.Copy(io.Discard, reader); readErr != nil {
+		return nil, p.failPart(ctx, request, claim.LeaseToken, "body_size_mismatch", readErr)
+	}
+	if err := exact.Verify(); err != nil {
+		return nil, p.failPart(ctx, request, claim.LeaseToken, "body_size_mismatch", err)
+	}
+
+	var (
+		actualChecksum *string
+		blockHashes    []byte
+	)
+	if shouldHash {
+		blockHashes = hasher.Sum()
+		if len(blockHashes) == 0 || len(blockHashes)%treehash.DigestSize != 0 {
+			return nil, p.failPart(ctx, request, claim.LeaseToken, "hash_generation_failed", ErrInvalidUpload)
+		}
+		value := treehash.SumToHex(treehash.ComputeTreeHash(blockHashes))
+		actualChecksum = &value
+		if request.Checksum != nil && !strings.EqualFold(*request.Checksum, value) {
+			// The re-sent body disagrees with the stored message; keep the
+			// receipt takeable for a retry with the correct body.
+			return nil, p.failPart(ctx, request, claim.LeaseToken, "checksum_mismatch", ErrChecksumMismatch)
+		}
+	}
+	if renewErr := pendingRenewError(renewErrors); renewErr != nil {
+		return nil, renewErr
+	}
+	if adoption.StoredSize != expectedStoredSize {
+		return nil, p.rejectPublished(ctx, request, claim.LeaseToken, telegramstore.StoredPart{ChannelID: adoption.ChannelID, MessageID: adoption.MessageID, Size: adoption.StoredSize}, "telegram_size_mismatch", ErrStoredSizeMismatch)
+	}
+
+	part, err := p.commitPart(ctx, request, claim.LeaseToken, adoption.ChannelID, uploads.StorePartInput{
+		UploadID:    request.UploadID,
+		PartNo:      request.PartNo,
+		LeaseToken:  claim.LeaseToken,
+		MessageID:   adoption.MessageID,
+		StoredSize:  adoption.StoredSize,
+		Checksum:    valueOrEmpty(actualChecksum),
+		Salt:        nil,
+		BlockHashes: append([]byte(nil), blockHashes...),
+	})
+	if err != nil {
+		return nil, err
+	}
+	slog.DebugContext(ctx, "upload part adopted from published receipt", "upload_id", request.UploadID, "part_no", request.PartNo, "channel_id", adoption.ChannelID, "message_id", adoption.MessageID, "stored_size", adoption.StoredSize)
+	return &UploadPartResult{Part: part}, nil
+}
+
+// commitPart stores the part and reconciles ambiguous failures. When the
+// database outcome is uncertain it re-reads the part: a part already stored
+// with the same message is the original commit result and is returned as
+// success. Nothing is deleted on failure; published receipts remain takeable
+// or are swept by the cleanup worker.
+func (p *Pipeline) commitPart(ctx context.Context, request UploadPartRequest, leaseToken uuid.UUID, channelID int64, in uploads.StorePartInput) (*sqlcgen.UploadPart, error) {
+	storeCtx, cancelStore := partCleanupContext(ctx)
+	defer cancelStore()
+	part, err := p.catalog.StorePart(storeCtx, in)
+	if err == nil {
+		return part, nil
+	}
+	if errors.Is(err, uploads.ErrLeaseLost) {
+		return nil, err
+	}
+	retryCtx, cancelRetry := partCleanupContext(ctx)
+	defer cancelRetry()
+	if part, retryErr := p.catalog.StorePart(retryCtx, in); retryErr == nil {
+		return part, nil
+	}
+	committed, getErr := p.catalog.GetPart(retryCtx, request.UserID, request.UploadID, request.PartNo)
+	if getErr == nil && committed.State == sqlcgen.UploadPartStateStored &&
+		committed.ChannelID == channelID && committed.MessageID.Valid &&
+		committed.MessageID.Int64 == in.MessageID {
+		return committed, nil
+	}
+	return nil, err
+}
+
+// rejectPublished condemns this attempt's published receipt, removes the
+// remote message and marks the part failed. A lost lease (zero condemned rows)
+// means the message belongs to another owner and is left untouched.
+func (p *Pipeline) rejectPublished(ctx context.Context, request UploadPartRequest, leaseToken uuid.UUID, published telegramstore.StoredPart, code string, cause error) error {
+	cleanupCtx, cancel := partCleanupContext(ctx)
+	defer cancel()
+	var cleanup error
+	condemned, condemnErr := p.catalog.CondemnPartReceipt(cleanupCtx, uploads.CondemnPartReceiptInput{
+		UploadID:   request.UploadID,
+		PartNo:     request.PartNo,
+		LeaseToken: leaseToken,
+	})
+	if condemnErr != nil {
+		cleanup = errors.Join(cleanup, fmt.Errorf("condemn uploaded part: %w", condemnErr))
+	}
+	if condemnErr == nil && condemned > 0 {
+		if err := p.storage.DeleteMessages(cleanupCtx, request.UserID, published.ChannelID, []int64{published.MessageID}); err != nil {
+			cleanup = errors.Join(cleanup, fmt.Errorf("compensate Telegram upload: %w", err))
+		} else if err := p.catalog.DeletePartReceipt(cleanupCtx, uploads.DeletePartReceiptInput{
+			UploadID:   request.UploadID,
+			PartNo:     request.PartNo,
+			LeaseToken: leaseToken,
+			MessageID:  published.MessageID,
+		}); err != nil {
+			cleanup = errors.Join(cleanup, err)
+		}
+	}
+	return p.failPart(ctx, request, leaseToken, code, errors.Join(cause, cleanup))
 }
 
 func (p *Pipeline) failPart(ctx context.Context, request UploadPartRequest, leaseToken uuid.UUID, code string, cause error) error {

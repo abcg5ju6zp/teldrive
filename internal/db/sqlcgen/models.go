@@ -267,6 +267,50 @@ func (ns NullTelegramLoginMethod) Value() (driver.Value, error) {
 	return string(ns.TelegramLoginMethod), nil
 }
 
+type UploadPartReceiptState string
+
+const (
+	UploadPartReceiptStatePending   UploadPartReceiptState = "pending"
+	UploadPartReceiptStatePublished UploadPartReceiptState = "published"
+	UploadPartReceiptStateAdopted   UploadPartReceiptState = "adopted"
+	UploadPartReceiptStateDeleting  UploadPartReceiptState = "deleting"
+)
+
+func (e *UploadPartReceiptState) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = UploadPartReceiptState(s)
+	case string:
+		*e = UploadPartReceiptState(s)
+	default:
+		return fmt.Errorf("unsupported scan type for UploadPartReceiptState: %T", src)
+	}
+	return nil
+}
+
+type NullUploadPartReceiptState struct {
+	UploadPartReceiptState UploadPartReceiptState `json:"upload_part_receipt_state"`
+	Valid                  bool                   `json:"valid"` // Valid is true if UploadPartReceiptState is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullUploadPartReceiptState) Scan(value interface{}) error {
+	if value == nil {
+		ns.UploadPartReceiptState, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.UploadPartReceiptState.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullUploadPartReceiptState) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.UploadPartReceiptState), nil
+}
+
 type UploadPartState string
 
 const (
@@ -592,6 +636,24 @@ type UploadPart struct {
 	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
 	// Concatenated 32-byte BLAKE3 hashes for each 16 MiB plaintext block in this upload part.
 	BlockHashes []byte `json:"block_hashes"`
+}
+
+type UploadPartReceipt struct {
+	UploadID       pgtype.UUID            `json:"upload_id"`
+	PartNo         int32                  `json:"part_no"`
+	LeaseToken     pgtype.UUID            `json:"lease_token"`
+	ChannelID      int64                  `json:"channel_id"`
+	PlainSize      int64                  `json:"plain_size"`
+	MessageID      pgtype.Int8            `json:"message_id"`
+	StoredSize     pgtype.Int8            `json:"stored_size"`
+	Checksum       pgtype.Text            `json:"checksum"`
+	Salt           pgtype.Text            `json:"salt"`
+	BlockHashes    []byte                 `json:"block_hashes"`
+	State          UploadPartReceiptState `json:"state"`
+	LeaseExpiresAt pgtype.Timestamptz     `json:"lease_expires_at"`
+	PublishedAt    pgtype.Timestamptz     `json:"published_at"`
+	CreatedAt      pgtype.Timestamptz     `json:"created_at"`
+	UpdatedAt      pgtype.Timestamptz     `json:"updated_at"`
 }
 
 type UploadSession struct {

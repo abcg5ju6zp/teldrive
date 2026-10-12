@@ -36,13 +36,14 @@ WHERE table_schema = 'teldrive'
   AND table_name IN (
     'users', 'sessions', 'api_keys', 'bots', 'channels',
     'files', 'file_parts', 'upload_sessions', 'upload_parts',
+    'upload_part_receipts',
     'file_shares', 'idempotency_keys', 'audit_events',
     'user_events', 'user_event_stream_state', 'event_stream_tickets'
   )`).Scan(&appTableCount); err != nil {
 		t.Fatalf("count migrated application tables: %v", err)
 	}
-	if appTableCount != 15 {
-		t.Fatalf("migrated application table count = %d, want 15", appTableCount)
+	if appTableCount != 16 {
+		t.Fatalf("migrated application table count = %d, want 16", appTableCount)
 	}
 
 	var publicTableCount int
@@ -61,8 +62,8 @@ WHERE table_schema = 'public'
 	if err := db.Pool.QueryRow(ctx, "SELECT max(version_id) FROM teldrive.migrations WHERE is_applied").Scan(&migrationVersion); err != nil {
 		t.Fatalf("read migration version: %v", err)
 	}
-	if migrationVersion != 7 {
-		t.Fatalf("migration version = %d, want 7", migrationVersion)
+	if migrationVersion != 9 {
+		t.Fatalf("migration version = %d, want 9", migrationVersion)
 	}
 
 	var normalizedNameColumns int

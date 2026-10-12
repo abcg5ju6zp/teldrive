@@ -41,6 +41,7 @@ var (
 	ErrInvalidChannel            = errors.New("invalid storage channel")
 	ErrHashMismatch              = errors.New("upload hash does not match expected hash")
 	ErrUnsupportedConflictPolicy = errors.New("upload conflict policy is not implemented")
+	ErrAdoptionUnavailable       = errors.New("upload part receipt is no longer adoptable")
 )
 
 type CatalogCacheInvalidator interface {
@@ -222,6 +223,35 @@ type ClaimPartResult struct {
 	Part       *sqlcgen.UploadPart
 	LeaseToken uuid.UUID
 	Existing   bool
+	// Adoption is set when a takeable published receipt was claimed instead of
+	// reserving a fresh Telegram upload. The pipeline stores the part from the
+	// receipt's message without publishing again.
+	Adoption *Adoption
+}
+
+// Adoption describes the durable remote message handed to a new lease owner.
+type Adoption struct {
+	ChannelID  int64
+	MessageID  int64
+	StoredSize int64
+	PlainSize  int64
+	Salt       *string
+	Checksum   *string
+}
+
+type FindTakeableInput struct {
+	UserID    int64
+	UploadID  uuid.UUID
+	PartNo    int32
+	PlainSize int64
+}
+
+type ClaimAdoptionInput struct {
+	UserID    int64
+	UploadID  uuid.UUID
+	PartNo    int32
+	PlainSize int64
+	Checksum  *string
 }
 
 func (s *Service) ClaimPart(ctx context.Context, in ClaimPartInput) (*ClaimPartResult, error) {
@@ -273,14 +303,22 @@ func (s *Service) ClaimPart(ctx context.Context, in ClaimPartInput) (*ClaimPartR
 	}
 
 	leaseToken := uuid.New()
-	part, err := s.queries.ClaimUploadPart(ctx, sqlcgen.ClaimUploadPartParams{
+	leaseExpiresAt := s.now().UTC().Add(s.leaseTTL)
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("begin upload part claim: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	q := s.queries.WithTx(tx)
+
+	part, err := q.ClaimUploadPart(ctx, sqlcgen.ClaimUploadPartParams{
 		UploadID:       dbtypes.UUID(in.UploadID),
 		PartNo:         in.PartNo,
 		ChannelID:      in.ChannelID,
 		PlainSize:      in.PlainSize,
 		Checksum:       dbtypes.OptionalText(in.Checksum),
 		LeaseToken:     dbtypes.UUID(leaseToken),
-		LeaseExpiresAt: dbtypes.Time(s.now().UTC().Add(s.leaseTTL)),
+		LeaseExpiresAt: dbtypes.Time(leaseExpiresAt),
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrPartBusy
@@ -288,7 +326,201 @@ func (s *Service) ClaimPart(ctx context.Context, in ClaimPartInput) (*ClaimPartR
 	if err != nil {
 		return nil, fmt.Errorf("claim upload part: %w", err)
 	}
+	if err := q.InsertPartReceipt(ctx, sqlcgen.InsertPartReceiptParams{
+		UploadID:       dbtypes.UUID(in.UploadID),
+		PartNo:         in.PartNo,
+		LeaseToken:     dbtypes.UUID(leaseToken),
+		ChannelID:      in.ChannelID,
+		PlainSize:      in.PlainSize,
+		LeaseExpiresAt: dbtypes.Time(leaseExpiresAt),
+	}); err != nil {
+		return nil, fmt.Errorf("insert upload part receipt: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit upload part claim: %w", err)
+	}
 	return &ClaimPartResult{Part: part, LeaseToken: leaseToken}, nil
+}
+
+// FindTakeablePart returns a published message receipt that a new attempt can
+// adopt instead of publishing again. It returns (nil, nil) when nothing
+// takeable exists. It never validates channel health so recovery works even
+// when a channel is full or temporarily unavailable.
+func (s *Service) FindTakeablePart(ctx context.Context, in FindTakeableInput) (*Adoption, error) {
+	if in.UserID <= 0 || in.UploadID == uuid.Nil || in.PartNo <= 0 || in.PlainSize < 0 {
+		return nil, ErrInvalidInput
+	}
+	session, err := s.Get(ctx, in.UserID, in.UploadID)
+	if err != nil {
+		return nil, err
+	}
+	if session.State != sqlcgen.UploadStateOpen || !session.ExpiresAt.Time.After(s.now()) {
+		return nil, nil
+	}
+	receipt, err := s.queries.FindTakeablePartReceipt(ctx, sqlcgen.FindTakeablePartReceiptParams{
+		UploadID:  dbtypes.UUID(in.UploadID),
+		PartNo:    in.PartNo,
+		UserID:    in.UserID,
+		PlainSize: in.PlainSize,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("find takeable upload part receipt: %w", err)
+	}
+	return adoptionFromReceipt(receipt)
+}
+
+// ClaimPartForAdoption reserves the part and transfers the takeable receipt to
+// a fresh lease in one transaction. The channel ownership check is ownership
+// only: adopting a stored message must never trigger rollover or capacity
+// side effects.
+func (s *Service) ClaimPartForAdoption(ctx context.Context, in ClaimAdoptionInput) (*ClaimPartResult, error) {
+	if in.UserID <= 0 || in.UploadID == uuid.Nil || in.PartNo <= 0 || in.PlainSize <= 0 {
+		return nil, ErrInvalidInput
+	}
+	if in.Checksum != nil {
+		checksum, err := normalizeDigest(*in.Checksum)
+		if err != nil {
+			return nil, err
+		}
+		in.Checksum = &checksum
+	}
+	session, err := s.Get(ctx, in.UserID, in.UploadID)
+	if err != nil {
+		return nil, err
+	}
+	if session.State != sqlcgen.UploadStateOpen {
+		return nil, ErrInvalidState
+	}
+	if !session.ExpiresAt.Time.After(s.now()) {
+		return nil, ErrExpired
+	}
+	if err := validatePartShape(session, in.PartNo, in.PlainSize); err != nil {
+		return nil, err
+	}
+
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("begin part adoption: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	q := s.queries.WithTx(tx)
+
+	part, err := q.LockUploadPart(ctx, sqlcgen.LockUploadPartParams{
+		UploadID: dbtypes.UUID(in.UploadID),
+		PartNo:   in.PartNo,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrAdoptionUnavailable
+	}
+	if err != nil {
+		return nil, fmt.Errorf("lock upload part: %w", err)
+	}
+	if part.State == sqlcgen.UploadPartStateStored {
+		if part.PlainSize == in.PlainSize && (in.Checksum == nil || optionalTextEqual(part.Checksum, in.Checksum)) {
+			return &ClaimPartResult{Part: part, Existing: true}, nil
+		}
+		return nil, ErrPartConflict
+	}
+
+	receipt, err := q.LockTakeablePartReceipt(ctx, sqlcgen.LockTakeablePartReceiptParams{
+		UploadID: dbtypes.UUID(in.UploadID),
+		PartNo:   in.PartNo,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrAdoptionUnavailable
+	}
+	if err != nil {
+		return nil, fmt.Errorf("lock takeable upload part receipt: %w", err)
+	}
+	if !receipt.MessageID.Valid || !receipt.StoredSize.Valid {
+		return nil, ErrAdoptionUnavailable
+	}
+	if receipt.PlainSize != in.PlainSize {
+		return nil, ErrPartConflict
+	}
+	if _, err := q.GetChannelForUser(ctx, sqlcgen.GetChannelForUserParams{
+		UserID:    in.UserID,
+		ChannelID: receipt.ChannelID,
+	}); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrInvalidChannel
+		}
+		return nil, fmt.Errorf("get adopted upload channel: %w", err)
+	}
+
+	leaseToken := uuid.New()
+	leaseExpiresAt := s.now().UTC().Add(s.leaseTTL)
+	claimed, err := q.ClaimUploadPartOnReceipt(ctx, sqlcgen.ClaimUploadPartOnReceiptParams{
+		ChannelID:      receipt.ChannelID,
+		PlainSize:      in.PlainSize,
+		Checksum:       dbtypes.OptionalText(in.Checksum),
+		LeaseToken:     dbtypes.UUID(leaseToken),
+		LeaseExpiresAt: dbtypes.Time(leaseExpiresAt),
+		UploadID:       dbtypes.UUID(in.UploadID),
+		PartNo:         in.PartNo,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrAdoptionUnavailable
+	}
+	if err != nil {
+		return nil, fmt.Errorf("claim upload part from receipt: %w", err)
+	}
+	if err := q.DeletePartReceiptByLease(ctx, sqlcgen.DeletePartReceiptByLeaseParams{
+		UploadID:   dbtypes.UUID(in.UploadID),
+		PartNo:     in.PartNo,
+		LeaseToken: receipt.LeaseToken,
+	}); err != nil {
+		return nil, fmt.Errorf("transfer adopted upload receipt: %w", err)
+	}
+	if err := q.InsertTakeoverReceipt(ctx, sqlcgen.InsertTakeoverReceiptParams{
+		UploadID:       dbtypes.UUID(in.UploadID),
+		PartNo:         in.PartNo,
+		LeaseToken:     dbtypes.UUID(leaseToken),
+		ChannelID:      receipt.ChannelID,
+		PlainSize:      in.PlainSize,
+		MessageID:      receipt.MessageID,
+		StoredSize:     receipt.StoredSize,
+		Salt:           receipt.Salt,
+		LeaseExpiresAt: dbtypes.Time(leaseExpiresAt),
+		PublishedAt:    receipt.PublishedAt,
+	}); err != nil {
+		return nil, fmt.Errorf("insert adopted upload receipt: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit part adoption: %w", err)
+	}
+	adoption, err := adoptionFromReceipt(receipt)
+	if err != nil {
+		return nil, err
+	}
+	return &ClaimPartResult{Part: claimed, LeaseToken: leaseToken, Adoption: adoption}, nil
+}
+
+func adoptionFromReceipt(receipt *sqlcgen.UploadPartReceipt) (*Adoption, error) {
+	if !receipt.MessageID.Valid || !receipt.StoredSize.Valid {
+		return nil, ErrAdoptionUnavailable
+	}
+	var salt *string
+	if receipt.Salt.Valid {
+		value := receipt.Salt.String
+		salt = &value
+	}
+	var checksum *string
+	if receipt.Checksum.Valid {
+		value := receipt.Checksum.String
+		checksum = &value
+	}
+	return &Adoption{
+		ChannelID:  receipt.ChannelID,
+		MessageID:  receipt.MessageID.Int64,
+		StoredSize: receipt.StoredSize.Int64,
+		PlainSize:  receipt.PlainSize,
+		Salt:       salt,
+		Checksum:   checksum,
+	}, nil
 }
 
 type StorePartInput struct {
@@ -342,7 +574,7 @@ func (s *Service) StorePart(ctx context.Context, in StorePartInput) (*sqlcgen.Up
 		}
 		checksum = &normalized
 	}
-	part, err := s.queries.MarkUploadPartStored(ctx, sqlcgen.MarkUploadPartStoredParams{
+	stored, err := s.queries.AdoptStoredPart(ctx, sqlcgen.AdoptStoredPartParams{
 		MessageID:   dbtypes.Int8(in.MessageID),
 		StoredSize:  dbtypes.Int8(in.StoredSize),
 		Checksum:    dbtypes.OptionalText(checksum),
@@ -358,7 +590,150 @@ func (s *Service) StorePart(ctx context.Context, in StorePartInput) (*sqlcgen.Up
 	if err != nil {
 		return nil, fmt.Errorf("store upload part: %w", err)
 	}
-	return part, nil
+	return storedPartFromRow(stored), nil
+}
+
+func storedPartFromRow(row *sqlcgen.AdoptStoredPartRow) *sqlcgen.UploadPart {
+	return &sqlcgen.UploadPart{
+		UploadID:       row.UploadID,
+		PartNo:         row.PartNo,
+		ChannelID:      row.ChannelID,
+		MessageID:      row.MessageID,
+		PlainSize:      row.PlainSize,
+		StoredSize:     row.StoredSize,
+		Checksum:       row.Checksum,
+		Salt:           row.Salt,
+		State:          row.State,
+		LeaseToken:     row.LeaseToken,
+		LeaseExpiresAt: row.LeaseExpiresAt,
+		LastErrorCode:  row.LastErrorCode,
+		CreatedAt:      row.CreatedAt,
+		UpdatedAt:      row.UpdatedAt,
+		BlockHashes:    row.BlockHashes,
+	}
+}
+
+type RecordPublicationInput struct {
+	UploadID   uuid.UUID
+	PartNo     int32
+	LeaseToken uuid.UUID
+	MessageID  int64
+	StoredSize int64
+	Salt       *string
+}
+
+// RecordPartPublication durably records the published Telegram message on the
+// attempt's own receipt. The receipt token (not the part lease) guards the
+// write, so an uploader whose part lease expired still preserves a takeable
+// receipt instead of orphaning the message.
+func (s *Service) RecordPartPublication(ctx context.Context, in RecordPublicationInput) error {
+	if in.UploadID == uuid.Nil || in.PartNo <= 0 || in.LeaseToken == uuid.Nil || in.MessageID <= 0 || in.StoredSize < 0 {
+		return ErrInvalidInput
+	}
+	_, err := s.queries.RecordPartPublication(ctx, sqlcgen.RecordPartPublicationParams{
+		MessageID:  dbtypes.Int8(in.MessageID),
+		StoredSize: dbtypes.Int8(in.StoredSize),
+		Salt:       dbtypes.OptionalText(in.Salt),
+		UploadID:   dbtypes.UUID(in.UploadID),
+		PartNo:     in.PartNo,
+		LeaseToken: dbtypes.UUID(in.LeaseToken),
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrLeaseLost
+	}
+	if err != nil {
+		return fmt.Errorf("record upload part publication: %w", err)
+	}
+	return nil
+}
+
+type AttachReceiptHashesInput struct {
+	UploadID    uuid.UUID
+	PartNo      int32
+	LeaseToken  uuid.UUID
+	Checksum    string
+	BlockHashes []byte
+}
+
+// AttachPartReceiptHashes persists verification metadata on the published
+// receipt before storing the part, so a later takeover can prove the re-sent
+// body matches the original upload.
+func (s *Service) AttachPartReceiptHashes(ctx context.Context, in AttachReceiptHashesInput) error {
+	if in.UploadID == uuid.Nil || in.PartNo <= 0 || in.LeaseToken == uuid.Nil ||
+		strings.TrimSpace(in.Checksum) == "" || len(in.BlockHashes) == 0 || len(in.BlockHashes)%treehash.DigestSize != 0 {
+		return ErrInvalidInput
+	}
+	checksum, err := normalizeDigest(in.Checksum)
+	if err != nil {
+		return err
+	}
+	updated, err := s.queries.AttachPartReceiptHashes(ctx, sqlcgen.AttachPartReceiptHashesParams{
+		Checksum:    dbtypes.Text(checksum),
+		BlockHashes: append([]byte(nil), in.BlockHashes...),
+		UploadID:    dbtypes.UUID(in.UploadID),
+		PartNo:      in.PartNo,
+		LeaseToken:  dbtypes.UUID(in.LeaseToken),
+	})
+	if err != nil {
+		return fmt.Errorf("attach upload receipt hashes: %w", err)
+	}
+	if updated == 0 {
+		return ErrLeaseLost
+	}
+	return nil
+}
+
+type CondemnPartReceiptInput struct {
+	UploadID   uuid.UUID
+	PartNo     int32
+	LeaseToken uuid.UUID
+}
+
+// CondemnPartReceipt marks the attempt's published receipt for deletion. It
+// returns the number of condemned rows: zero means the attempt no longer owns
+// the message (lease transferred or already committed) and the caller must not
+// delete it.
+func (s *Service) CondemnPartReceipt(ctx context.Context, in CondemnPartReceiptInput) (int64, error) {
+	if in.UploadID == uuid.Nil || in.PartNo <= 0 || in.LeaseToken == uuid.Nil {
+		return 0, ErrInvalidInput
+	}
+	condemned, err := s.queries.CondemnPartReceipt(ctx, sqlcgen.CondemnPartReceiptParams{
+		UploadID:   dbtypes.UUID(in.UploadID),
+		PartNo:     in.PartNo,
+		LeaseToken: dbtypes.UUID(in.LeaseToken),
+	})
+	if err != nil {
+		return 0, fmt.Errorf("condemn upload part receipt: %w", err)
+	}
+	return condemned, nil
+}
+
+type DeletePartReceiptInput struct {
+	UploadID   uuid.UUID
+	PartNo     int32
+	LeaseToken uuid.UUID
+	MessageID  int64
+}
+
+// DeletePartReceipt removes the attempt's receipt after its remote message has
+// been confirmed deleted. It never deletes a committed receipt.
+func (s *Service) DeletePartReceipt(ctx context.Context, in DeletePartReceiptInput) error {
+	if in.UploadID == uuid.Nil || in.PartNo <= 0 || in.LeaseToken == uuid.Nil {
+		return ErrInvalidInput
+	}
+	var messageID pgtype.Int8
+	if in.MessageID > 0 {
+		messageID = dbtypes.Int8(in.MessageID)
+	}
+	if err := s.queries.DeletePartReceipt(ctx, sqlcgen.DeletePartReceiptParams{
+		UploadID:   dbtypes.UUID(in.UploadID),
+		PartNo:     in.PartNo,
+		LeaseToken: dbtypes.UUID(in.LeaseToken),
+		MessageID:  messageID,
+	}); err != nil {
+		return fmt.Errorf("delete upload part receipt: %w", err)
+	}
+	return nil
 }
 
 type FailPartInput struct {

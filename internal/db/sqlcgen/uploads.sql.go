@@ -53,6 +53,154 @@ func (q *Queries) AbortUploadSession(ctx context.Context, arg AbortUploadSession
 	return &i, err
 }
 
+const adoptStoredPart = `-- name: AdoptStoredPart :one
+WITH target_receipt AS (
+    SELECT target.upload_id, target.part_no, target.lease_token, target.channel_id, target.plain_size, target.message_id, target.stored_size, target.checksum, target.salt, target.block_hashes, target.state, target.lease_expires_at, target.published_at, target.created_at, target.updated_at
+    FROM /* TEMPLATE: schema */upload_part_receipts target
+    WHERE target.upload_id = $1
+      AND target.part_no = $2
+      AND target.lease_token = $3
+      AND target.state IN ('pending', 'published')
+    FOR UPDATE OF target
+),
+stored AS (
+    UPDATE /* TEMPLATE: schema */upload_parts p
+    SET message_id = $4,
+        stored_size = $5,
+        checksum = $6,
+        salt = COALESCE(tr.salt, $7),
+        block_hashes = $8,
+        state = 'stored',
+        lease_token = NULL,
+        lease_expires_at = NULL,
+        last_error_code = NULL,
+        updated_at = now()
+    FROM target_receipt tr
+    WHERE p.upload_id = tr.upload_id
+      AND p.part_no = tr.part_no
+      AND p.state = 'uploading'
+      AND p.lease_token = tr.lease_token
+      AND p.channel_id = tr.channel_id
+    RETURNING p.upload_id, p.part_no, p.channel_id, p.message_id, p.plain_size, p.stored_size, p.checksum, p.salt, p.state, p.lease_token, p.lease_expires_at, p.last_error_code, p.created_at, p.updated_at, p.block_hashes
+),
+adopted AS (
+    UPDATE /* TEMPLATE: schema */upload_part_receipts r
+    SET message_id = s.message_id,
+        stored_size = s.stored_size,
+        checksum = s.checksum,
+        salt = COALESCE(r.salt, s.salt),
+        block_hashes = s.block_hashes,
+        state = 'adopted',
+        published_at = COALESCE(r.published_at, now()),
+        updated_at = now()
+    FROM target_receipt tr
+    CROSS JOIN stored s
+    WHERE r.upload_id = tr.upload_id
+      AND r.part_no = tr.part_no
+      AND r.lease_token = tr.lease_token
+)
+SELECT stored.upload_id, stored.part_no, stored.channel_id, stored.message_id, stored.plain_size, stored.stored_size, stored.checksum, stored.salt, stored.state, stored.lease_token, stored.lease_expires_at, stored.last_error_code, stored.created_at, stored.updated_at, stored.block_hashes
+FROM stored
+`
+
+type AdoptStoredPartParams struct {
+	UploadID    pgtype.UUID `json:"upload_id"`
+	PartNo      int32       `json:"part_no"`
+	LeaseToken  pgtype.UUID `json:"lease_token"`
+	MessageID   pgtype.Int8 `json:"message_id"`
+	StoredSize  pgtype.Int8 `json:"stored_size"`
+	Checksum    pgtype.Text `json:"checksum"`
+	Salt        pgtype.Text `json:"salt"`
+	BlockHashes []byte      `json:"block_hashes"`
+}
+
+type AdoptStoredPartRow struct {
+	UploadID       pgtype.UUID        `json:"upload_id"`
+	PartNo         int32              `json:"part_no"`
+	ChannelID      int64              `json:"channel_id"`
+	MessageID      pgtype.Int8        `json:"message_id"`
+	PlainSize      int64              `json:"plain_size"`
+	StoredSize     pgtype.Int8        `json:"stored_size"`
+	Checksum       pgtype.Text        `json:"checksum"`
+	Salt           pgtype.Text        `json:"salt"`
+	State          UploadPartState    `json:"state"`
+	LeaseToken     pgtype.UUID        `json:"lease_token"`
+	LeaseExpiresAt pgtype.Timestamptz `json:"lease_expires_at"`
+	LastErrorCode  pgtype.Text        `json:"last_error_code"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
+	BlockHashes    []byte             `json:"block_hashes"`
+}
+
+// Commits the stored part and its remote-message receipt in one transaction.
+// The receipt may still be 'pending' for direct StorePart callers; after a
+// normal publish it is 'published'. The receipt owns the encryption salt once
+// a message has been published.
+func (q *Queries) AdoptStoredPart(ctx context.Context, arg AdoptStoredPartParams) (*AdoptStoredPartRow, error) {
+	row := q.db.QueryRow(ctx, adoptStoredPart,
+		arg.UploadID,
+		arg.PartNo,
+		arg.LeaseToken,
+		arg.MessageID,
+		arg.StoredSize,
+		arg.Checksum,
+		arg.Salt,
+		arg.BlockHashes,
+	)
+	var i AdoptStoredPartRow
+	err := row.Scan(
+		&i.UploadID,
+		&i.PartNo,
+		&i.ChannelID,
+		&i.MessageID,
+		&i.PlainSize,
+		&i.StoredSize,
+		&i.Checksum,
+		&i.Salt,
+		&i.State,
+		&i.LeaseToken,
+		&i.LeaseExpiresAt,
+		&i.LastErrorCode,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.BlockHashes,
+	)
+	return &i, err
+}
+
+const attachPartReceiptHashes = `-- name: AttachPartReceiptHashes :execrows
+UPDATE /* TEMPLATE: schema */upload_part_receipts
+SET checksum = $1,
+    block_hashes = $2,
+    updated_at = now()
+WHERE upload_id = $3
+  AND part_no = $4
+  AND lease_token = $5
+  AND state = 'published'
+`
+
+type AttachPartReceiptHashesParams struct {
+	Checksum    pgtype.Text `json:"checksum"`
+	BlockHashes []byte      `json:"block_hashes"`
+	UploadID    pgtype.UUID `json:"upload_id"`
+	PartNo      int32       `json:"part_no"`
+	LeaseToken  pgtype.UUID `json:"lease_token"`
+}
+
+func (q *Queries) AttachPartReceiptHashes(ctx context.Context, arg AttachPartReceiptHashesParams) (int64, error) {
+	result, err := q.db.Exec(ctx, attachPartReceiptHashes,
+		arg.Checksum,
+		arg.BlockHashes,
+		arg.UploadID,
+		arg.PartNo,
+		arg.LeaseToken,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const claimUploadPart = `-- name: ClaimUploadPart :one
 INSERT INTO /* TEMPLATE: schema */upload_parts (
     upload_id,
@@ -131,6 +279,67 @@ func (q *Queries) ClaimUploadPart(ctx context.Context, arg ClaimUploadPartParams
 	return &i, err
 }
 
+const claimUploadPartOnReceipt = `-- name: ClaimUploadPartOnReceipt :one
+UPDATE /* TEMPLATE: schema */upload_parts
+SET channel_id = $1,
+    plain_size = $2,
+    checksum = $3,
+    state = 'uploading',
+    lease_token = $4,
+    lease_expires_at = $5,
+    last_error_code = NULL,
+    updated_at = now()
+WHERE upload_id = $6
+  AND part_no = $7
+  AND state <> 'stored'
+  AND (
+      lease_expires_at IS NULL
+      OR lease_expires_at < now()
+  )
+RETURNING upload_id, part_no, channel_id, message_id, plain_size, stored_size, checksum, salt, state, lease_token, lease_expires_at, last_error_code, created_at, updated_at, block_hashes
+`
+
+type ClaimUploadPartOnReceiptParams struct {
+	ChannelID      int64              `json:"channel_id"`
+	PlainSize      int64              `json:"plain_size"`
+	Checksum       pgtype.Text        `json:"checksum"`
+	LeaseToken     pgtype.UUID        `json:"lease_token"`
+	LeaseExpiresAt pgtype.Timestamptz `json:"lease_expires_at"`
+	UploadID       pgtype.UUID        `json:"upload_id"`
+	PartNo         int32              `json:"part_no"`
+}
+
+func (q *Queries) ClaimUploadPartOnReceipt(ctx context.Context, arg ClaimUploadPartOnReceiptParams) (*UploadPart, error) {
+	row := q.db.QueryRow(ctx, claimUploadPartOnReceipt,
+		arg.ChannelID,
+		arg.PlainSize,
+		arg.Checksum,
+		arg.LeaseToken,
+		arg.LeaseExpiresAt,
+		arg.UploadID,
+		arg.PartNo,
+	)
+	var i UploadPart
+	err := row.Scan(
+		&i.UploadID,
+		&i.PartNo,
+		&i.ChannelID,
+		&i.MessageID,
+		&i.PlainSize,
+		&i.StoredSize,
+		&i.Checksum,
+		&i.Salt,
+		&i.State,
+		&i.LeaseToken,
+		&i.LeaseExpiresAt,
+		&i.LastErrorCode,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.BlockHashes,
+	)
+	return &i, err
+}
+
 const completeUploadSession = `-- name: CompleteUploadSession :one
 UPDATE /* TEMPLATE: schema */upload_sessions
 SET state = 'completed',
@@ -174,6 +383,30 @@ func (q *Queries) CompleteUploadSession(ctx context.Context, arg CompleteUploadS
 		&i.CompletedAt,
 	)
 	return &i, err
+}
+
+const condemnPartReceipt = `-- name: CondemnPartReceipt :execrows
+UPDATE /* TEMPLATE: schema */upload_part_receipts
+SET state = 'deleting',
+    updated_at = now()
+WHERE upload_id = $1
+  AND part_no = $2
+  AND lease_token = $3
+  AND state = 'published'
+`
+
+type CondemnPartReceiptParams struct {
+	UploadID   pgtype.UUID `json:"upload_id"`
+	PartNo     int32       `json:"part_no"`
+	LeaseToken pgtype.UUID `json:"lease_token"`
+}
+
+func (q *Queries) CondemnPartReceipt(ctx context.Context, arg CondemnPartReceiptParams) (int64, error) {
+	result, err := q.db.Exec(ctx, condemnPartReceipt, arg.UploadID, arg.PartNo, arg.LeaseToken)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const countInvalidOpenEndedUploadParts = `-- name: CountInvalidOpenEndedUploadParts :one
@@ -298,6 +531,228 @@ func (q *Queries) CreateUploadSession(ctx context.Context, arg CreateUploadSessi
 		&i.CompletedAt,
 	)
 	return &i, err
+}
+
+const deleteAdoptedReceipts = `-- name: DeleteAdoptedReceipts :execrows
+WITH gone AS (
+    SELECT r.upload_id AS upload_id, r.part_no AS part_no, r.lease_token AS lease_token
+    FROM /* TEMPLATE: schema */upload_part_receipts r
+    JOIN /* TEMPLATE: schema */upload_sessions us ON us.id = r.upload_id
+    WHERE r.state = 'adopted'
+      AND (
+          us.state = 'completed'
+          OR NOT EXISTS (
+              SELECT 1
+              FROM /* TEMPLATE: schema */upload_parts up
+              WHERE up.upload_id = r.upload_id
+                AND up.part_no = r.part_no
+                AND up.channel_id = r.channel_id
+                AND up.message_id = r.message_id
+          )
+      )
+    LIMIT 1000
+)
+DELETE FROM /* TEMPLATE: schema */upload_part_receipts
+WHERE (upload_id, part_no, lease_token) IN (SELECT upload_id, part_no, lease_token FROM gone)
+`
+
+// Committed-class row garbage collection: adopted receipts never require a
+// remote delete. They are removed once the file is committed (file_parts is
+// the durable reference) or their stored part row has already been cleaned.
+func (q *Queries) DeleteAdoptedReceipts(ctx context.Context) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteAdoptedReceipts)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const deleteCondemnedReceiptsForCleanup = `-- name: DeleteCondemnedReceiptsForCleanup :execrows
+DELETE FROM /* TEMPLATE: schema */upload_part_receipts AS receipt
+USING jsonb_to_recordset($1::jsonb) AS cleanup_receipt(
+    upload_id uuid,
+    part_no integer,
+    lease_token uuid,
+    channel_id bigint,
+    message_id bigint
+)
+WHERE receipt.upload_id = cleanup_receipt.upload_id
+  AND receipt.part_no = cleanup_receipt.part_no
+  AND receipt.lease_token = cleanup_receipt.lease_token
+  AND receipt.channel_id = cleanup_receipt.channel_id
+  AND receipt.message_id = cleanup_receipt.message_id
+  AND receipt.state = 'deleting'
+  AND NOT EXISTS (
+      SELECT 1
+      FROM /* TEMPLATE: schema */upload_parts up
+      WHERE up.channel_id = receipt.channel_id
+        AND up.message_id = receipt.message_id
+  )
+  AND NOT EXISTS (
+      SELECT 1
+      FROM /* TEMPLATE: schema */file_parts fp
+      WHERE fp.channel_id = receipt.channel_id
+        AND fp.message_id = receipt.message_id
+  )
+`
+
+func (q *Queries) DeleteCondemnedReceiptsForCleanup(ctx context.Context, receipts []byte) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteCondemnedReceiptsForCleanup, receipts)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const deleteDeadPendingReceipts = `-- name: DeleteDeadPendingReceipts :execrows
+WITH dead AS (
+    SELECT r.upload_id AS upload_id, r.part_no AS part_no, r.lease_token AS lease_token
+    FROM /* TEMPLATE: schema */upload_part_receipts r
+    JOIN /* TEMPLATE: schema */upload_sessions us ON us.id = r.upload_id
+    WHERE r.state = 'pending'
+      AND (
+          r.lease_expires_at < now()
+          OR us.state IN ('aborted', 'expired')
+      )
+    LIMIT 1000
+)
+DELETE FROM /* TEMPLATE: schema */upload_part_receipts
+WHERE (upload_id, part_no, lease_token) IN (SELECT upload_id, part_no, lease_token FROM dead)
+`
+
+// Not-yet-published class: drop intent rows whose lease is dead. No remote
+// message exists for these receipts, so no Telegram call is involved.
+func (q *Queries) DeleteDeadPendingReceipts(ctx context.Context) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteDeadPendingReceipts)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const deletePartReceipt = `-- name: DeletePartReceipt :exec
+DELETE FROM /* TEMPLATE: schema */upload_part_receipts
+WHERE upload_id = $1
+  AND part_no = $2
+  AND lease_token = $3
+  AND message_id IS NOT DISTINCT FROM $4
+`
+
+type DeletePartReceiptParams struct {
+	UploadID   pgtype.UUID `json:"upload_id"`
+	PartNo     int32       `json:"part_no"`
+	LeaseToken pgtype.UUID `json:"lease_token"`
+	MessageID  pgtype.Int8 `json:"message_id"`
+}
+
+func (q *Queries) DeletePartReceipt(ctx context.Context, arg DeletePartReceiptParams) error {
+	_, err := q.db.Exec(ctx, deletePartReceipt,
+		arg.UploadID,
+		arg.PartNo,
+		arg.LeaseToken,
+		arg.MessageID,
+	)
+	return err
+}
+
+const deletePartReceiptByLease = `-- name: DeletePartReceiptByLease :exec
+DELETE FROM /* TEMPLATE: schema */upload_part_receipts
+WHERE upload_id = $1
+  AND part_no = $2
+  AND lease_token = $3
+`
+
+type DeletePartReceiptByLeaseParams struct {
+	UploadID   pgtype.UUID `json:"upload_id"`
+	PartNo     int32       `json:"part_no"`
+	LeaseToken pgtype.UUID `json:"lease_token"`
+}
+
+func (q *Queries) DeletePartReceiptByLease(ctx context.Context, arg DeletePartReceiptByLeaseParams) error {
+	_, err := q.db.Exec(ctx, deletePartReceiptByLease, arg.UploadID, arg.PartNo, arg.LeaseToken)
+	return err
+}
+
+const deleteSupersededReceiptsForCleanup = `-- name: DeleteSupersededReceiptsForCleanup :execrows
+DELETE FROM /* TEMPLATE: schema */upload_part_receipts AS receipt
+USING /* TEMPLATE: schema */upload_parts AS part,
+      jsonb_to_recordset($1::jsonb) AS cleanup_receipt(
+          upload_id uuid,
+          part_no integer,
+          lease_token uuid,
+          channel_id bigint,
+          message_id bigint
+      )
+WHERE receipt.upload_id = cleanup_receipt.upload_id
+  AND receipt.part_no = cleanup_receipt.part_no
+  AND receipt.lease_token = cleanup_receipt.lease_token
+  AND receipt.channel_id = cleanup_receipt.channel_id
+  AND receipt.message_id = cleanup_receipt.message_id
+  AND part.upload_id = receipt.upload_id
+  AND part.part_no = receipt.part_no
+  AND part.state = 'stored'
+  AND part.message_id IS DISTINCT FROM receipt.message_id
+  AND receipt.state = 'published'
+  AND NOT EXISTS (
+      SELECT 1
+      FROM /* TEMPLATE: schema */upload_parts up
+      WHERE up.channel_id = receipt.channel_id
+        AND up.message_id = receipt.message_id
+  )
+  AND NOT EXISTS (
+      SELECT 1
+      FROM /* TEMPLATE: schema */file_parts fp
+      WHERE fp.channel_id = receipt.channel_id
+        AND fp.message_id = receipt.message_id
+  )
+`
+
+func (q *Queries) DeleteSupersededReceiptsForCleanup(ctx context.Context, receipts []byte) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteSupersededReceiptsForCleanup, receipts)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const deleteUploadPartReceiptsForCleanup = `-- name: DeleteUploadPartReceiptsForCleanup :execrows
+DELETE FROM /* TEMPLATE: schema */upload_part_receipts AS receipt
+USING /* TEMPLATE: schema */upload_sessions AS session,
+      jsonb_to_recordset($1::jsonb) AS cleanup_receipt(
+          upload_id uuid,
+          part_no integer,
+          lease_token uuid,
+          channel_id bigint,
+          message_id bigint
+      )
+WHERE receipt.upload_id = cleanup_receipt.upload_id
+  AND receipt.part_no = cleanup_receipt.part_no
+  AND receipt.lease_token = cleanup_receipt.lease_token
+  AND receipt.channel_id = cleanup_receipt.channel_id
+  AND receipt.message_id = cleanup_receipt.message_id
+  AND session.id = receipt.upload_id
+  AND session.state IN ('aborted', 'expired')
+  AND receipt.state IN ('published', 'deleting')
+  AND NOT EXISTS (
+      SELECT 1
+      FROM /* TEMPLATE: schema */upload_parts up
+      WHERE up.channel_id = receipt.channel_id
+        AND up.message_id = receipt.message_id
+  )
+  AND NOT EXISTS (
+      SELECT 1
+      FROM /* TEMPLATE: schema */file_parts fp
+      WHERE fp.channel_id = receipt.channel_id
+        AND fp.message_id = receipt.message_id
+  )
+`
+
+func (q *Queries) DeleteUploadPartReceiptsForCleanup(ctx context.Context, receipts []byte) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteUploadPartReceiptsForCleanup, receipts)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const deleteUploadPartsForCleanup = `-- name: DeleteUploadPartsForCleanup :execrows
@@ -498,6 +953,63 @@ func (q *Queries) FindResumableUploadSessions(ctx context.Context, arg FindResum
 		return nil, err
 	}
 	return items, nil
+}
+
+const findTakeablePartReceipt = `-- name: FindTakeablePartReceipt :one
+SELECT r.upload_id, r.part_no, r.lease_token, r.channel_id, r.plain_size, r.message_id, r.stored_size, r.checksum, r.salt, r.block_hashes, r.state, r.lease_expires_at, r.published_at, r.created_at, r.updated_at
+FROM /* TEMPLATE: schema */upload_part_receipts r
+JOIN /* TEMPLATE: schema */upload_sessions us ON us.id = r.upload_id
+JOIN /* TEMPLATE: schema */upload_parts p ON p.upload_id = r.upload_id AND p.part_no = r.part_no
+WHERE r.upload_id = $1
+  AND r.part_no = $2
+  AND us.user_id = $3
+  AND r.plain_size = $4
+  AND us.state = 'open'
+  AND us.expires_at > now()
+  AND p.state <> 'stored'
+  AND r.state = 'published'
+  AND r.message_id IS NOT NULL
+  AND (
+      r.lease_token IS DISTINCT FROM p.lease_token
+      OR r.lease_expires_at < now()
+  )
+ORDER BY r.published_at DESC, r.created_at DESC
+LIMIT 1
+`
+
+type FindTakeablePartReceiptParams struct {
+	UploadID  pgtype.UUID `json:"upload_id"`
+	PartNo    int32       `json:"part_no"`
+	UserID    int64       `json:"user_id"`
+	PlainSize int64       `json:"plain_size"`
+}
+
+func (q *Queries) FindTakeablePartReceipt(ctx context.Context, arg FindTakeablePartReceiptParams) (*UploadPartReceipt, error) {
+	row := q.db.QueryRow(ctx, findTakeablePartReceipt,
+		arg.UploadID,
+		arg.PartNo,
+		arg.UserID,
+		arg.PlainSize,
+	)
+	var i UploadPartReceipt
+	err := row.Scan(
+		&i.UploadID,
+		&i.PartNo,
+		&i.LeaseToken,
+		&i.ChannelID,
+		&i.PlainSize,
+		&i.MessageID,
+		&i.StoredSize,
+		&i.Checksum,
+		&i.Salt,
+		&i.BlockHashes,
+		&i.State,
+		&i.LeaseExpiresAt,
+		&i.PublishedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return &i, err
 }
 
 const getAllUploadPartSummary = `-- name: GetAllUploadPartSummary :one
@@ -789,6 +1301,190 @@ func (q *Queries) InsertFilePartsFromUpload(ctx context.Context, arg InsertFileP
 	return result.RowsAffected(), nil
 }
 
+const insertPartReceipt = `-- name: InsertPartReceipt :exec
+
+INSERT INTO /* TEMPLATE: schema */upload_part_receipts (
+    upload_id,
+    part_no,
+    lease_token,
+    channel_id,
+    plain_size,
+    state,
+    lease_expires_at
+) VALUES (
+    $1,
+    $2,
+    $3,
+    $4,
+    $5,
+    'pending',
+    $6
+)
+`
+
+type InsertPartReceiptParams struct {
+	UploadID       pgtype.UUID        `json:"upload_id"`
+	PartNo         int32              `json:"part_no"`
+	LeaseToken     pgtype.UUID        `json:"lease_token"`
+	ChannelID      int64              `json:"channel_id"`
+	PlainSize      int64              `json:"plain_size"`
+	LeaseExpiresAt pgtype.Timestamptz `json:"lease_expires_at"`
+}
+
+// --------------------------------------------------------------------------
+// Remote message receipts: durable record of Telegram messages published for
+// an upload attempt, enabling publish-once retries and three-class cleanup
+// (not published / committed / safe to delete).
+// --------------------------------------------------------------------------
+func (q *Queries) InsertPartReceipt(ctx context.Context, arg InsertPartReceiptParams) error {
+	_, err := q.db.Exec(ctx, insertPartReceipt,
+		arg.UploadID,
+		arg.PartNo,
+		arg.LeaseToken,
+		arg.ChannelID,
+		arg.PlainSize,
+		arg.LeaseExpiresAt,
+	)
+	return err
+}
+
+const insertTakeoverReceipt = `-- name: InsertTakeoverReceipt :exec
+INSERT INTO /* TEMPLATE: schema */upload_part_receipts (
+    upload_id,
+    part_no,
+    lease_token,
+    channel_id,
+    plain_size,
+    message_id,
+    stored_size,
+    salt,
+    state,
+    lease_expires_at,
+    published_at
+) VALUES (
+    $1,
+    $2,
+    $3,
+    $4,
+    $5,
+    $6,
+    $7,
+    $8,
+    'published',
+    $9,
+    $10
+)
+`
+
+type InsertTakeoverReceiptParams struct {
+	UploadID       pgtype.UUID        `json:"upload_id"`
+	PartNo         int32              `json:"part_no"`
+	LeaseToken     pgtype.UUID        `json:"lease_token"`
+	ChannelID      int64              `json:"channel_id"`
+	PlainSize      int64              `json:"plain_size"`
+	MessageID      pgtype.Int8        `json:"message_id"`
+	StoredSize     pgtype.Int8        `json:"stored_size"`
+	Salt           pgtype.Text        `json:"salt"`
+	LeaseExpiresAt pgtype.Timestamptz `json:"lease_expires_at"`
+	PublishedAt    pgtype.Timestamptz `json:"published_at"`
+}
+
+func (q *Queries) InsertTakeoverReceipt(ctx context.Context, arg InsertTakeoverReceiptParams) error {
+	_, err := q.db.Exec(ctx, insertTakeoverReceipt,
+		arg.UploadID,
+		arg.PartNo,
+		arg.LeaseToken,
+		arg.ChannelID,
+		arg.PlainSize,
+		arg.MessageID,
+		arg.StoredSize,
+		arg.Salt,
+		arg.LeaseExpiresAt,
+		arg.PublishedAt,
+	)
+	return err
+}
+
+const listCondemnedReceiptsForCleanup = `-- name: ListCondemnedReceiptsForCleanup :many
+SELECT us.user_id AS user_id, r.upload_id, r.part_no, r.lease_token, r.channel_id, r.plain_size, r.message_id, r.stored_size, r.checksum, r.salt, r.block_hashes, r.state, r.lease_expires_at, r.published_at, r.created_at, r.updated_at
+FROM /* TEMPLATE: schema */upload_part_receipts r
+JOIN /* TEMPLATE: schema */upload_sessions us ON us.id = r.upload_id
+WHERE r.state = 'deleting'
+  AND r.message_id IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1
+      FROM /* TEMPLATE: schema */upload_parts up
+      WHERE up.channel_id = r.channel_id
+        AND up.message_id = r.message_id
+  )
+  AND NOT EXISTS (
+      SELECT 1
+      FROM /* TEMPLATE: schema */file_parts fp
+      WHERE fp.channel_id = r.channel_id
+        AND fp.message_id = r.message_id
+  )
+ORDER BY r.updated_at, r.upload_id, r.part_no
+LIMIT 1000
+`
+
+type ListCondemnedReceiptsForCleanupRow struct {
+	UserID         int64                  `json:"user_id"`
+	UploadID       pgtype.UUID            `json:"upload_id"`
+	PartNo         int32                  `json:"part_no"`
+	LeaseToken     pgtype.UUID            `json:"lease_token"`
+	ChannelID      int64                  `json:"channel_id"`
+	PlainSize      int64                  `json:"plain_size"`
+	MessageID      pgtype.Int8            `json:"message_id"`
+	StoredSize     pgtype.Int8            `json:"stored_size"`
+	Checksum       pgtype.Text            `json:"checksum"`
+	Salt           pgtype.Text            `json:"salt"`
+	BlockHashes    []byte                 `json:"block_hashes"`
+	State          UploadPartReceiptState `json:"state"`
+	LeaseExpiresAt pgtype.Timestamptz     `json:"lease_expires_at"`
+	PublishedAt    pgtype.Timestamptz     `json:"published_at"`
+	CreatedAt      pgtype.Timestamptz     `json:"created_at"`
+	UpdatedAt      pgtype.Timestamptz     `json:"updated_at"`
+}
+
+// Condemned messages can belong to still-open sessions (validation failures or
+// lost leases), so they are swept independently of session state.
+func (q *Queries) ListCondemnedReceiptsForCleanup(ctx context.Context) ([]*ListCondemnedReceiptsForCleanupRow, error) {
+	rows, err := q.db.Query(ctx, listCondemnedReceiptsForCleanup)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []*ListCondemnedReceiptsForCleanupRow{}
+	for rows.Next() {
+		var i ListCondemnedReceiptsForCleanupRow
+		if err := rows.Scan(
+			&i.UserID,
+			&i.UploadID,
+			&i.PartNo,
+			&i.LeaseToken,
+			&i.ChannelID,
+			&i.PlainSize,
+			&i.MessageID,
+			&i.StoredSize,
+			&i.Checksum,
+			&i.Salt,
+			&i.BlockHashes,
+			&i.State,
+			&i.LeaseExpiresAt,
+			&i.PublishedAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, &i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listStoredUploadPartHashes = `-- name: ListStoredUploadPartHashes :many
 SELECT block_hashes
 FROM /* TEMPLATE: schema */upload_parts
@@ -810,6 +1506,89 @@ func (q *Queries) ListStoredUploadPartHashes(ctx context.Context, uploadID pgtyp
 			return nil, err
 		}
 		items = append(items, block_hashes)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listSupersededPublishedReceipts = `-- name: ListSupersededPublishedReceipts :many
+SELECT us.user_id AS user_id, r.upload_id, r.part_no, r.lease_token, r.channel_id, r.plain_size, r.message_id, r.stored_size, r.checksum, r.salt, r.block_hashes, r.state, r.lease_expires_at, r.published_at, r.created_at, r.updated_at
+FROM /* TEMPLATE: schema */upload_part_receipts r
+JOIN /* TEMPLATE: schema */upload_sessions us ON us.id = r.upload_id
+JOIN /* TEMPLATE: schema */upload_parts p ON p.upload_id = r.upload_id AND p.part_no = r.part_no
+WHERE r.state = 'published'
+  AND r.message_id IS NOT NULL
+  AND p.state = 'stored'
+  AND p.message_id IS DISTINCT FROM r.message_id
+  AND NOT EXISTS (
+      SELECT 1
+      FROM /* TEMPLATE: schema */upload_parts up
+      WHERE up.channel_id = r.channel_id
+        AND up.message_id = r.message_id
+  )
+  AND NOT EXISTS (
+      SELECT 1
+      FROM /* TEMPLATE: schema */file_parts fp
+      WHERE fp.channel_id = r.channel_id
+        AND fp.message_id = r.message_id
+  )
+ORDER BY r.updated_at, r.upload_id, r.part_no
+LIMIT 1000
+`
+
+type ListSupersededPublishedReceiptsRow struct {
+	UserID         int64                  `json:"user_id"`
+	UploadID       pgtype.UUID            `json:"upload_id"`
+	PartNo         int32                  `json:"part_no"`
+	LeaseToken     pgtype.UUID            `json:"lease_token"`
+	ChannelID      int64                  `json:"channel_id"`
+	PlainSize      int64                  `json:"plain_size"`
+	MessageID      pgtype.Int8            `json:"message_id"`
+	StoredSize     pgtype.Int8            `json:"stored_size"`
+	Checksum       pgtype.Text            `json:"checksum"`
+	Salt           pgtype.Text            `json:"salt"`
+	BlockHashes    []byte                 `json:"block_hashes"`
+	State          UploadPartReceiptState `json:"state"`
+	LeaseExpiresAt pgtype.Timestamptz     `json:"lease_expires_at"`
+	PublishedAt    pgtype.Timestamptz     `json:"published_at"`
+	CreatedAt      pgtype.Timestamptz     `json:"created_at"`
+	UpdatedAt      pgtype.Timestamptz     `json:"updated_at"`
+}
+
+// Published receipts whose part committed a different message (duplicate
+// publishes after lease takeover); their own message is unreferenced.
+func (q *Queries) ListSupersededPublishedReceipts(ctx context.Context) ([]*ListSupersededPublishedReceiptsRow, error) {
+	rows, err := q.db.Query(ctx, listSupersededPublishedReceipts)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []*ListSupersededPublishedReceiptsRow{}
+	for rows.Next() {
+		var i ListSupersededPublishedReceiptsRow
+		if err := rows.Scan(
+			&i.UserID,
+			&i.UploadID,
+			&i.PartNo,
+			&i.LeaseToken,
+			&i.ChannelID,
+			&i.PlainSize,
+			&i.MessageID,
+			&i.StoredSize,
+			&i.Checksum,
+			&i.Salt,
+			&i.BlockHashes,
+			&i.State,
+			&i.LeaseExpiresAt,
+			&i.PublishedAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, &i)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -862,6 +1641,87 @@ func (q *Queries) ListUploadDailyStatistics(ctx context.Context, arg ListUploadD
 	for rows.Next() {
 		var i ListUploadDailyStatisticsRow
 		if err := rows.Scan(&i.Day, &i.UploadedBytes, &i.CompletedFiles); err != nil {
+			return nil, err
+		}
+		items = append(items, &i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listUploadPartReceiptsForCleanupMany = `-- name: ListUploadPartReceiptsForCleanupMany :many
+SELECT us.user_id AS user_id, r.upload_id, r.part_no, r.lease_token, r.channel_id, r.plain_size, r.message_id, r.stored_size, r.checksum, r.salt, r.block_hashes, r.state, r.lease_expires_at, r.published_at, r.created_at, r.updated_at
+FROM /* TEMPLATE: schema */upload_part_receipts r
+JOIN /* TEMPLATE: schema */upload_sessions us ON us.id = r.upload_id
+WHERE us.id = ANY($1::uuid[])
+  AND us.state IN ('aborted', 'expired')
+  AND r.state IN ('published', 'deleting')
+  AND r.message_id IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1
+      FROM /* TEMPLATE: schema */upload_parts up
+      WHERE up.channel_id = r.channel_id
+        AND up.message_id = r.message_id
+  )
+  AND NOT EXISTS (
+      SELECT 1
+      FROM /* TEMPLATE: schema */file_parts fp
+      WHERE fp.channel_id = r.channel_id
+        AND fp.message_id = r.message_id
+  )
+ORDER BY r.upload_id, r.channel_id, r.part_no
+`
+
+type ListUploadPartReceiptsForCleanupManyRow struct {
+	UserID         int64                  `json:"user_id"`
+	UploadID       pgtype.UUID            `json:"upload_id"`
+	PartNo         int32                  `json:"part_no"`
+	LeaseToken     pgtype.UUID            `json:"lease_token"`
+	ChannelID      int64                  `json:"channel_id"`
+	PlainSize      int64                  `json:"plain_size"`
+	MessageID      pgtype.Int8            `json:"message_id"`
+	StoredSize     pgtype.Int8            `json:"stored_size"`
+	Checksum       pgtype.Text            `json:"checksum"`
+	Salt           pgtype.Text            `json:"salt"`
+	BlockHashes    []byte                 `json:"block_hashes"`
+	State          UploadPartReceiptState `json:"state"`
+	LeaseExpiresAt pgtype.Timestamptz     `json:"lease_expires_at"`
+	PublishedAt    pgtype.Timestamptz     `json:"published_at"`
+	CreatedAt      pgtype.Timestamptz     `json:"created_at"`
+	UpdatedAt      pgtype.Timestamptz     `json:"updated_at"`
+}
+
+// Safe-to-delete receipts of aborted or expired sessions whose message is not
+// referenced by any stored upload part or committed file part.
+func (q *Queries) ListUploadPartReceiptsForCleanupMany(ctx context.Context, uploadIds []pgtype.UUID) ([]*ListUploadPartReceiptsForCleanupManyRow, error) {
+	rows, err := q.db.Query(ctx, listUploadPartReceiptsForCleanupMany, uploadIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []*ListUploadPartReceiptsForCleanupManyRow{}
+	for rows.Next() {
+		var i ListUploadPartReceiptsForCleanupManyRow
+		if err := rows.Scan(
+			&i.UserID,
+			&i.UploadID,
+			&i.PartNo,
+			&i.LeaseToken,
+			&i.ChannelID,
+			&i.PlainSize,
+			&i.MessageID,
+			&i.StoredSize,
+			&i.Checksum,
+			&i.Salt,
+			&i.BlockHashes,
+			&i.State,
+			&i.LeaseExpiresAt,
+			&i.PublishedAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, &i)
@@ -1088,9 +1948,22 @@ func (q *Queries) ListUploadSessions(ctx context.Context, arg ListUploadSessions
 const listUploadSessionsPendingCleanup = `-- name: ListUploadSessionsPendingCleanup :many
 SELECT DISTINCT us.id, us.user_id, us.parent_id, us.name, us.expected_size, us.expected_hash_algorithm, us.expected_hash_value, us.mime_type, us.mod_time, us.encryption, us.encryption_key_version, us.conflict_policy, us.part_size, us.state, us.file_id, us.expires_at, us.created_at, us.updated_at, us.completed_at
 FROM /* TEMPLATE: schema */upload_sessions us
-JOIN /* TEMPLATE: schema */upload_parts up ON up.upload_id = us.id
 WHERE us.state IN ('aborted', 'expired')
-  AND up.message_id IS NOT NULL
+  AND (
+      EXISTS (
+          SELECT 1
+          FROM /* TEMPLATE: schema */upload_parts up
+          WHERE up.upload_id = us.id
+            AND up.message_id IS NOT NULL
+      )
+      OR EXISTS (
+          SELECT 1
+          FROM /* TEMPLATE: schema */upload_part_receipts r
+          WHERE r.upload_id = us.id
+            AND r.state IN ('published', 'deleting')
+            AND r.message_id IS NOT NULL
+      )
+  )
 ORDER BY us.updated_at, us.id
 LIMIT 1000
 `
@@ -1135,6 +2008,55 @@ func (q *Queries) ListUploadSessionsPendingCleanup(ctx context.Context) ([]*Uplo
 	return items, nil
 }
 
+const lockTakeablePartReceipt = `-- name: LockTakeablePartReceipt :one
+SELECT r.upload_id, r.part_no, r.lease_token, r.channel_id, r.plain_size, r.message_id, r.stored_size, r.checksum, r.salt, r.block_hashes, r.state, r.lease_expires_at, r.published_at, r.created_at, r.updated_at
+FROM /* TEMPLATE: schema */upload_part_receipts r
+JOIN /* TEMPLATE: schema */upload_sessions us ON us.id = r.upload_id
+JOIN /* TEMPLATE: schema */upload_parts p ON p.upload_id = r.upload_id AND p.part_no = r.part_no
+WHERE r.upload_id = $1
+  AND r.part_no = $2
+  AND us.state = 'open'
+  AND us.expires_at > now()
+  AND p.state <> 'stored'
+  AND r.state = 'published'
+  AND r.message_id IS NOT NULL
+  AND (
+      r.lease_token IS DISTINCT FROM p.lease_token
+      OR r.lease_expires_at < now()
+  )
+ORDER BY r.published_at DESC, r.created_at DESC
+LIMIT 1
+FOR UPDATE OF r
+`
+
+type LockTakeablePartReceiptParams struct {
+	UploadID pgtype.UUID `json:"upload_id"`
+	PartNo   int32       `json:"part_no"`
+}
+
+func (q *Queries) LockTakeablePartReceipt(ctx context.Context, arg LockTakeablePartReceiptParams) (*UploadPartReceipt, error) {
+	row := q.db.QueryRow(ctx, lockTakeablePartReceipt, arg.UploadID, arg.PartNo)
+	var i UploadPartReceipt
+	err := row.Scan(
+		&i.UploadID,
+		&i.PartNo,
+		&i.LeaseToken,
+		&i.ChannelID,
+		&i.PlainSize,
+		&i.MessageID,
+		&i.StoredSize,
+		&i.Checksum,
+		&i.Salt,
+		&i.BlockHashes,
+		&i.State,
+		&i.LeaseExpiresAt,
+		&i.PublishedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return &i, err
+}
+
 const lockUploadDestinationConflict = `-- name: LockUploadDestinationConflict :one
 SELECT id, user_id, parent_id, name, kind, mime_type, size, hash_algorithm, hash_value, encryption, encryption_key_version, status, mod_time, generation, created_at, updated_at, deleted_at
 FROM /* TEMPLATE: schema */files
@@ -1172,6 +2094,42 @@ func (q *Queries) LockUploadDestinationConflict(ctx context.Context, arg LockUpl
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.DeletedAt,
+	)
+	return &i, err
+}
+
+const lockUploadPart = `-- name: LockUploadPart :one
+SELECT upload_id, part_no, channel_id, message_id, plain_size, stored_size, checksum, salt, state, lease_token, lease_expires_at, last_error_code, created_at, updated_at, block_hashes
+FROM /* TEMPLATE: schema */upload_parts
+WHERE upload_id = $1
+  AND part_no = $2
+FOR UPDATE
+`
+
+type LockUploadPartParams struct {
+	UploadID pgtype.UUID `json:"upload_id"`
+	PartNo   int32       `json:"part_no"`
+}
+
+func (q *Queries) LockUploadPart(ctx context.Context, arg LockUploadPartParams) (*UploadPart, error) {
+	row := q.db.QueryRow(ctx, lockUploadPart, arg.UploadID, arg.PartNo)
+	var i UploadPart
+	err := row.Scan(
+		&i.UploadID,
+		&i.PartNo,
+		&i.ChannelID,
+		&i.MessageID,
+		&i.PlainSize,
+		&i.StoredSize,
+		&i.Checksum,
+		&i.Salt,
+		&i.State,
+		&i.LeaseToken,
+		&i.LeaseExpiresAt,
+		&i.LastErrorCode,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.BlockHashes,
 	)
 	return &i, err
 }
@@ -1283,16 +2241,23 @@ func (q *Queries) MarkUploadCompleting(ctx context.Context, arg MarkUploadComple
 }
 
 const markUploadPartFailed = `-- name: MarkUploadPartFailed :one
+WITH drop_pending AS (
+    DELETE FROM /* TEMPLATE: schema */upload_part_receipts
+    WHERE upload_id = $2
+      AND part_no = $3
+      AND lease_token = $4
+      AND state = 'pending'
+)
 UPDATE /* TEMPLATE: schema */upload_parts
 SET state = 'failed',
     lease_token = NULL,
     lease_expires_at = NULL,
     last_error_code = $1,
     updated_at = now()
-WHERE upload_id = $2
-  AND part_no = $3
-  AND lease_token = $4
-RETURNING upload_id, part_no, channel_id, message_id, plain_size, stored_size, checksum, salt, state, lease_token, lease_expires_at, last_error_code, created_at, updated_at, block_hashes
+WHERE upload_parts.upload_id = $2
+  AND upload_parts.part_no = $3
+  AND upload_parts.lease_token = $4
+RETURNING upload_parts.upload_id, upload_parts.part_no, upload_parts.channel_id, upload_parts.message_id, upload_parts.plain_size, upload_parts.stored_size, upload_parts.checksum, upload_parts.salt, upload_parts.state, upload_parts.lease_token, upload_parts.lease_expires_at, upload_parts.last_error_code, upload_parts.created_at, upload_parts.updated_at, upload_parts.block_hashes
 `
 
 type MarkUploadPartFailedParams struct {
@@ -1330,64 +2295,56 @@ func (q *Queries) MarkUploadPartFailed(ctx context.Context, arg MarkUploadPartFa
 	return &i, err
 }
 
-const markUploadPartStored = `-- name: MarkUploadPartStored :one
-UPDATE /* TEMPLATE: schema */upload_parts
+const recordPartPublication = `-- name: RecordPartPublication :one
+UPDATE /* TEMPLATE: schema */upload_part_receipts
 SET message_id = $1,
     stored_size = $2,
-    checksum = $3,
-    salt = $4,
-    block_hashes = $5,
-    state = 'stored',
-    lease_token = NULL,
-    lease_expires_at = NULL,
-    last_error_code = NULL,
+    salt = $3,
+    state = 'published',
+    published_at = now(),
     updated_at = now()
-WHERE upload_id = $6
-  AND part_no = $7
-  AND state = 'uploading'
-  AND lease_token = $8
-RETURNING upload_id, part_no, channel_id, message_id, plain_size, stored_size, checksum, salt, state, lease_token, lease_expires_at, last_error_code, created_at, updated_at, block_hashes
+WHERE upload_id = $4
+  AND part_no = $5
+  AND lease_token = $6
+  AND state = 'pending'
+RETURNING upload_id, part_no, lease_token, channel_id, plain_size, message_id, stored_size, checksum, salt, block_hashes, state, lease_expires_at, published_at, created_at, updated_at
 `
 
-type MarkUploadPartStoredParams struct {
-	MessageID   pgtype.Int8 `json:"message_id"`
-	StoredSize  pgtype.Int8 `json:"stored_size"`
-	Checksum    pgtype.Text `json:"checksum"`
-	Salt        pgtype.Text `json:"salt"`
-	BlockHashes []byte      `json:"block_hashes"`
-	UploadID    pgtype.UUID `json:"upload_id"`
-	PartNo      int32       `json:"part_no"`
-	LeaseToken  pgtype.UUID `json:"lease_token"`
+type RecordPartPublicationParams struct {
+	MessageID  pgtype.Int8 `json:"message_id"`
+	StoredSize pgtype.Int8 `json:"stored_size"`
+	Salt       pgtype.Text `json:"salt"`
+	UploadID   pgtype.UUID `json:"upload_id"`
+	PartNo     int32       `json:"part_no"`
+	LeaseToken pgtype.UUID `json:"lease_token"`
 }
 
-func (q *Queries) MarkUploadPartStored(ctx context.Context, arg MarkUploadPartStoredParams) (*UploadPart, error) {
-	row := q.db.QueryRow(ctx, markUploadPartStored,
+func (q *Queries) RecordPartPublication(ctx context.Context, arg RecordPartPublicationParams) (*UploadPartReceipt, error) {
+	row := q.db.QueryRow(ctx, recordPartPublication,
 		arg.MessageID,
 		arg.StoredSize,
-		arg.Checksum,
 		arg.Salt,
-		arg.BlockHashes,
 		arg.UploadID,
 		arg.PartNo,
 		arg.LeaseToken,
 	)
-	var i UploadPart
+	var i UploadPartReceipt
 	err := row.Scan(
 		&i.UploadID,
 		&i.PartNo,
+		&i.LeaseToken,
 		&i.ChannelID,
-		&i.MessageID,
 		&i.PlainSize,
+		&i.MessageID,
 		&i.StoredSize,
 		&i.Checksum,
 		&i.Salt,
+		&i.BlockHashes,
 		&i.State,
-		&i.LeaseToken,
 		&i.LeaseExpiresAt,
-		&i.LastErrorCode,
+		&i.PublishedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
-		&i.BlockHashes,
 	)
 	return &i, err
 }
@@ -1415,13 +2372,21 @@ func (q *Queries) RenameUploadSession(ctx context.Context, arg RenameUploadSessi
 }
 
 const renewUploadPartLease = `-- name: RenewUploadPartLease :execrows
+WITH receipt AS (
+    UPDATE /* TEMPLATE: schema */upload_part_receipts
+    SET lease_expires_at = $1,
+        updated_at = now()
+    WHERE upload_id = $2
+      AND part_no = $3
+      AND lease_token = $4
+)
 UPDATE /* TEMPLATE: schema */upload_parts
 SET lease_expires_at = $1,
     updated_at = now()
-WHERE upload_id = $2
-  AND part_no = $3
-  AND state = 'uploading'
-  AND lease_token = $4
+WHERE upload_parts.upload_id = $2
+  AND upload_parts.part_no = $3
+  AND upload_parts.state = 'uploading'
+  AND upload_parts.lease_token = $4
 `
 
 type RenewUploadPartLeaseParams struct {

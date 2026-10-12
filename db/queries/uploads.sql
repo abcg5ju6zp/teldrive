@@ -121,44 +121,94 @@ WHERE /* TEMPLATE: schema */upload_parts.state <> 'stored'
   )
 RETURNING *;
 
--- name: MarkUploadPartStored :one
-UPDATE /* TEMPLATE: schema */upload_parts
-SET message_id = sqlc.arg(message_id),
-    stored_size = sqlc.arg(stored_size),
-    checksum = sqlc.narg(checksum),
-    salt = sqlc.narg(salt),
-    block_hashes = sqlc.narg(block_hashes),
-    state = 'stored',
-    lease_token = NULL,
-    lease_expires_at = NULL,
-    last_error_code = NULL,
-    updated_at = now()
-WHERE upload_id = sqlc.arg(upload_id)
-  AND part_no = sqlc.arg(part_no)
-  AND state = 'uploading'
-  AND lease_token = sqlc.arg(lease_token)
-RETURNING *;
-
 -- name: RenewUploadPartLease :execrows
+WITH receipt AS (
+    UPDATE /* TEMPLATE: schema */upload_part_receipts
+    SET lease_expires_at = sqlc.arg(lease_expires_at),
+        updated_at = now()
+    WHERE upload_id = sqlc.arg(upload_id)
+      AND part_no = sqlc.arg(part_no)
+      AND lease_token = sqlc.arg(lease_token)
+)
 UPDATE /* TEMPLATE: schema */upload_parts
 SET lease_expires_at = sqlc.arg(lease_expires_at),
     updated_at = now()
-WHERE upload_id = sqlc.arg(upload_id)
-  AND part_no = sqlc.arg(part_no)
-  AND state = 'uploading'
-  AND lease_token = sqlc.arg(lease_token);
+WHERE upload_parts.upload_id = sqlc.arg(upload_id)
+  AND upload_parts.part_no = sqlc.arg(part_no)
+  AND upload_parts.state = 'uploading'
+  AND upload_parts.lease_token = sqlc.arg(lease_token);
 
 -- name: MarkUploadPartFailed :one
+WITH drop_pending AS (
+    DELETE FROM /* TEMPLATE: schema */upload_part_receipts
+    WHERE upload_id = sqlc.arg(upload_id)
+      AND part_no = sqlc.arg(part_no)
+      AND lease_token = sqlc.arg(lease_token)
+      AND state = 'pending'
+)
 UPDATE /* TEMPLATE: schema */upload_parts
 SET state = 'failed',
     lease_token = NULL,
     lease_expires_at = NULL,
     last_error_code = sqlc.arg(error_code),
     updated_at = now()
-WHERE upload_id = sqlc.arg(upload_id)
-  AND part_no = sqlc.arg(part_no)
-  AND lease_token = sqlc.arg(lease_token)
-RETURNING *;
+WHERE upload_parts.upload_id = sqlc.arg(upload_id)
+  AND upload_parts.part_no = sqlc.arg(part_no)
+  AND upload_parts.lease_token = sqlc.arg(lease_token)
+RETURNING upload_parts.*;
+
+-- name: AdoptStoredPart :one
+-- Commits the stored part and its remote-message receipt in one transaction.
+-- The receipt may still be 'pending' for direct StorePart callers; after a
+-- normal publish it is 'published'. The receipt owns the encryption salt once
+-- a message has been published.
+WITH target_receipt AS (
+    SELECT target.*
+    FROM /* TEMPLATE: schema */upload_part_receipts target
+    WHERE target.upload_id = sqlc.arg(upload_id)
+      AND target.part_no = sqlc.arg(part_no)
+      AND target.lease_token = sqlc.arg(lease_token)
+      AND target.state IN ('pending', 'published')
+    FOR UPDATE OF target
+),
+stored AS (
+    UPDATE /* TEMPLATE: schema */upload_parts p
+    SET message_id = sqlc.arg(message_id),
+        stored_size = sqlc.arg(stored_size),
+        checksum = sqlc.narg(checksum),
+        salt = COALESCE(tr.salt, sqlc.narg(salt)),
+        block_hashes = sqlc.narg(block_hashes),
+        state = 'stored',
+        lease_token = NULL,
+        lease_expires_at = NULL,
+        last_error_code = NULL,
+        updated_at = now()
+    FROM target_receipt tr
+    WHERE p.upload_id = tr.upload_id
+      AND p.part_no = tr.part_no
+      AND p.state = 'uploading'
+      AND p.lease_token = tr.lease_token
+      AND p.channel_id = tr.channel_id
+    RETURNING p.*
+),
+adopted AS (
+    UPDATE /* TEMPLATE: schema */upload_part_receipts r
+    SET message_id = s.message_id,
+        stored_size = s.stored_size,
+        checksum = s.checksum,
+        salt = COALESCE(r.salt, s.salt),
+        block_hashes = s.block_hashes,
+        state = 'adopted',
+        published_at = COALESCE(r.published_at, now()),
+        updated_at = now()
+    FROM target_receipt tr
+    CROSS JOIN stored s
+    WHERE r.upload_id = tr.upload_id
+      AND r.part_no = tr.part_no
+      AND r.lease_token = tr.lease_token
+)
+SELECT stored.*
+FROM stored;
 
 -- name: ListUploadParts :many
 SELECT *
@@ -331,9 +381,22 @@ ORDER BY up.upload_id, up.channel_id, up.part_no;
 -- name: ListUploadSessionsPendingCleanup :many
 SELECT DISTINCT us.*
 FROM /* TEMPLATE: schema */upload_sessions us
-JOIN /* TEMPLATE: schema */upload_parts up ON up.upload_id = us.id
 WHERE us.state IN ('aborted', 'expired')
-  AND up.message_id IS NOT NULL
+  AND (
+      EXISTS (
+          SELECT 1
+          FROM /* TEMPLATE: schema */upload_parts up
+          WHERE up.upload_id = us.id
+            AND up.message_id IS NOT NULL
+      )
+      OR EXISTS (
+          SELECT 1
+          FROM /* TEMPLATE: schema */upload_part_receipts r
+          WHERE r.upload_id = us.id
+            AND r.state IN ('published', 'deleting')
+            AND r.message_id IS NOT NULL
+      )
+  )
 ORDER BY us.updated_at, us.id
 LIMIT 1000;
 
@@ -429,3 +492,375 @@ SELECT d.day, COALESCE(t.uploaded_bytes, 0)::bigint AS uploaded_bytes,
 FROM days d
 LEFT JOIN totals t USING (day)
 ORDER BY d.day;
+
+-- --------------------------------------------------------------------------
+-- Remote message receipts: durable record of Telegram messages published for
+-- an upload attempt, enabling publish-once retries and three-class cleanup
+-- (not published / committed / safe to delete).
+-- --------------------------------------------------------------------------
+
+-- name: InsertPartReceipt :exec
+INSERT INTO /* TEMPLATE: schema */upload_part_receipts (
+    upload_id,
+    part_no,
+    lease_token,
+    channel_id,
+    plain_size,
+    state,
+    lease_expires_at
+) VALUES (
+    sqlc.arg(upload_id),
+    sqlc.arg(part_no),
+    sqlc.arg(lease_token),
+    sqlc.arg(channel_id),
+    sqlc.arg(plain_size),
+    'pending',
+    sqlc.arg(lease_expires_at)
+);
+
+-- name: LockUploadPart :one
+SELECT *
+FROM /* TEMPLATE: schema */upload_parts
+WHERE upload_id = sqlc.arg(upload_id)
+  AND part_no = sqlc.arg(part_no)
+FOR UPDATE;
+
+-- name: FindTakeablePartReceipt :one
+SELECT r.*
+FROM /* TEMPLATE: schema */upload_part_receipts r
+JOIN /* TEMPLATE: schema */upload_sessions us ON us.id = r.upload_id
+JOIN /* TEMPLATE: schema */upload_parts p ON p.upload_id = r.upload_id AND p.part_no = r.part_no
+WHERE r.upload_id = sqlc.arg(upload_id)
+  AND r.part_no = sqlc.arg(part_no)
+  AND us.user_id = sqlc.arg(user_id)
+  AND r.plain_size = sqlc.arg(plain_size)
+  AND us.state = 'open'
+  AND us.expires_at > now()
+  AND p.state <> 'stored'
+  AND r.state = 'published'
+  AND r.message_id IS NOT NULL
+  AND (
+      r.lease_token IS DISTINCT FROM p.lease_token
+      OR r.lease_expires_at < now()
+  )
+ORDER BY r.published_at DESC, r.created_at DESC
+LIMIT 1;
+
+-- name: LockTakeablePartReceipt :one
+SELECT r.*
+FROM /* TEMPLATE: schema */upload_part_receipts r
+JOIN /* TEMPLATE: schema */upload_sessions us ON us.id = r.upload_id
+JOIN /* TEMPLATE: schema */upload_parts p ON p.upload_id = r.upload_id AND p.part_no = r.part_no
+WHERE r.upload_id = sqlc.arg(upload_id)
+  AND r.part_no = sqlc.arg(part_no)
+  AND us.state = 'open'
+  AND us.expires_at > now()
+  AND p.state <> 'stored'
+  AND r.state = 'published'
+  AND r.message_id IS NOT NULL
+  AND (
+      r.lease_token IS DISTINCT FROM p.lease_token
+      OR r.lease_expires_at < now()
+  )
+ORDER BY r.published_at DESC, r.created_at DESC
+LIMIT 1
+FOR UPDATE OF r;
+
+-- name: ClaimUploadPartOnReceipt :one
+UPDATE /* TEMPLATE: schema */upload_parts
+SET channel_id = sqlc.arg(channel_id),
+    plain_size = sqlc.arg(plain_size),
+    checksum = sqlc.narg(checksum),
+    state = 'uploading',
+    lease_token = sqlc.arg(lease_token),
+    lease_expires_at = sqlc.arg(lease_expires_at),
+    last_error_code = NULL,
+    updated_at = now()
+WHERE upload_id = sqlc.arg(upload_id)
+  AND part_no = sqlc.arg(part_no)
+  AND state <> 'stored'
+  AND (
+      lease_expires_at IS NULL
+      OR lease_expires_at < now()
+  )
+RETURNING *;
+
+-- name: InsertTakeoverReceipt :exec
+INSERT INTO /* TEMPLATE: schema */upload_part_receipts (
+    upload_id,
+    part_no,
+    lease_token,
+    channel_id,
+    plain_size,
+    message_id,
+    stored_size,
+    salt,
+    state,
+    lease_expires_at,
+    published_at
+) VALUES (
+    sqlc.arg(upload_id),
+    sqlc.arg(part_no),
+    sqlc.arg(lease_token),
+    sqlc.arg(channel_id),
+    sqlc.arg(plain_size),
+    sqlc.arg(message_id),
+    sqlc.arg(stored_size),
+    sqlc.narg(salt),
+    'published',
+    sqlc.arg(lease_expires_at),
+    sqlc.arg(published_at)
+);
+
+-- name: DeletePartReceiptByLease :exec
+DELETE FROM /* TEMPLATE: schema */upload_part_receipts
+WHERE upload_id = sqlc.arg(upload_id)
+  AND part_no = sqlc.arg(part_no)
+  AND lease_token = sqlc.arg(lease_token);
+
+-- name: RecordPartPublication :one
+UPDATE /* TEMPLATE: schema */upload_part_receipts
+SET message_id = sqlc.arg(message_id),
+    stored_size = sqlc.arg(stored_size),
+    salt = sqlc.narg(salt),
+    state = 'published',
+    published_at = now(),
+    updated_at = now()
+WHERE upload_id = sqlc.arg(upload_id)
+  AND part_no = sqlc.arg(part_no)
+  AND lease_token = sqlc.arg(lease_token)
+  AND state = 'pending'
+RETURNING *;
+
+-- name: CondemnPartReceipt :execrows
+UPDATE /* TEMPLATE: schema */upload_part_receipts
+SET state = 'deleting',
+    updated_at = now()
+WHERE upload_id = sqlc.arg(upload_id)
+  AND part_no = sqlc.arg(part_no)
+  AND lease_token = sqlc.arg(lease_token)
+  AND state = 'published';
+
+-- name: AttachPartReceiptHashes :execrows
+UPDATE /* TEMPLATE: schema */upload_part_receipts
+SET checksum = sqlc.arg(checksum),
+    block_hashes = sqlc.arg(block_hashes),
+    updated_at = now()
+WHERE upload_id = sqlc.arg(upload_id)
+  AND part_no = sqlc.arg(part_no)
+  AND lease_token = sqlc.arg(lease_token)
+  AND state = 'published';
+
+-- name: DeletePartReceipt :exec
+DELETE FROM /* TEMPLATE: schema */upload_part_receipts
+WHERE upload_id = sqlc.arg(upload_id)
+  AND part_no = sqlc.arg(part_no)
+  AND lease_token = sqlc.arg(lease_token)
+  AND message_id IS NOT DISTINCT FROM sqlc.narg(message_id);
+
+-- Not-yet-published class: drop intent rows whose lease is dead. No remote
+-- message exists for these receipts, so no Telegram call is involved.
+-- name: DeleteDeadPendingReceipts :execrows
+WITH dead AS (
+    SELECT r.upload_id AS upload_id, r.part_no AS part_no, r.lease_token AS lease_token
+    FROM /* TEMPLATE: schema */upload_part_receipts r
+    JOIN /* TEMPLATE: schema */upload_sessions us ON us.id = r.upload_id
+    WHERE r.state = 'pending'
+      AND (
+          r.lease_expires_at < now()
+          OR us.state IN ('aborted', 'expired')
+      )
+    LIMIT 1000
+)
+DELETE FROM /* TEMPLATE: schema */upload_part_receipts
+WHERE (upload_id, part_no, lease_token) IN (SELECT upload_id, part_no, lease_token FROM dead);
+
+-- name: ListUploadPartReceiptsForCleanupMany :many
+-- Safe-to-delete receipts of aborted or expired sessions whose message is not
+-- referenced by any stored upload part or committed file part.
+SELECT us.user_id AS user_id, r.*
+FROM /* TEMPLATE: schema */upload_part_receipts r
+JOIN /* TEMPLATE: schema */upload_sessions us ON us.id = r.upload_id
+WHERE us.id = ANY(sqlc.arg(upload_ids)::uuid[])
+  AND us.state IN ('aborted', 'expired')
+  AND r.state IN ('published', 'deleting')
+  AND r.message_id IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1
+      FROM /* TEMPLATE: schema */upload_parts up
+      WHERE up.channel_id = r.channel_id
+        AND up.message_id = r.message_id
+  )
+  AND NOT EXISTS (
+      SELECT 1
+      FROM /* TEMPLATE: schema */file_parts fp
+      WHERE fp.channel_id = r.channel_id
+        AND fp.message_id = r.message_id
+  )
+ORDER BY r.upload_id, r.channel_id, r.part_no;
+
+-- name: DeleteUploadPartReceiptsForCleanup :execrows
+DELETE FROM /* TEMPLATE: schema */upload_part_receipts AS receipt
+USING /* TEMPLATE: schema */upload_sessions AS session,
+      jsonb_to_recordset(sqlc.arg(receipts)::jsonb) AS cleanup_receipt(
+          upload_id uuid,
+          part_no integer,
+          lease_token uuid,
+          channel_id bigint,
+          message_id bigint
+      )
+WHERE receipt.upload_id = cleanup_receipt.upload_id
+  AND receipt.part_no = cleanup_receipt.part_no
+  AND receipt.lease_token = cleanup_receipt.lease_token
+  AND receipt.channel_id = cleanup_receipt.channel_id
+  AND receipt.message_id = cleanup_receipt.message_id
+  AND session.id = receipt.upload_id
+  AND session.state IN ('aborted', 'expired')
+  AND receipt.state IN ('published', 'deleting')
+  AND NOT EXISTS (
+      SELECT 1
+      FROM /* TEMPLATE: schema */upload_parts up
+      WHERE up.channel_id = receipt.channel_id
+        AND up.message_id = receipt.message_id
+  )
+  AND NOT EXISTS (
+      SELECT 1
+      FROM /* TEMPLATE: schema */file_parts fp
+      WHERE fp.channel_id = receipt.channel_id
+        AND fp.message_id = receipt.message_id
+  );
+
+-- name: ListCondemnedReceiptsForCleanup :many
+-- Condemned messages can belong to still-open sessions (validation failures or
+-- lost leases), so they are swept independently of session state.
+SELECT us.user_id AS user_id, r.*
+FROM /* TEMPLATE: schema */upload_part_receipts r
+JOIN /* TEMPLATE: schema */upload_sessions us ON us.id = r.upload_id
+WHERE r.state = 'deleting'
+  AND r.message_id IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1
+      FROM /* TEMPLATE: schema */upload_parts up
+      WHERE up.channel_id = r.channel_id
+        AND up.message_id = r.message_id
+  )
+  AND NOT EXISTS (
+      SELECT 1
+      FROM /* TEMPLATE: schema */file_parts fp
+      WHERE fp.channel_id = r.channel_id
+        AND fp.message_id = r.message_id
+  )
+ORDER BY r.updated_at, r.upload_id, r.part_no
+LIMIT 1000;
+
+-- name: DeleteCondemnedReceiptsForCleanup :execrows
+DELETE FROM /* TEMPLATE: schema */upload_part_receipts AS receipt
+USING jsonb_to_recordset(sqlc.arg(receipts)::jsonb) AS cleanup_receipt(
+    upload_id uuid,
+    part_no integer,
+    lease_token uuid,
+    channel_id bigint,
+    message_id bigint
+)
+WHERE receipt.upload_id = cleanup_receipt.upload_id
+  AND receipt.part_no = cleanup_receipt.part_no
+  AND receipt.lease_token = cleanup_receipt.lease_token
+  AND receipt.channel_id = cleanup_receipt.channel_id
+  AND receipt.message_id = cleanup_receipt.message_id
+  AND receipt.state = 'deleting'
+  AND NOT EXISTS (
+      SELECT 1
+      FROM /* TEMPLATE: schema */upload_parts up
+      WHERE up.channel_id = receipt.channel_id
+        AND up.message_id = receipt.message_id
+  )
+  AND NOT EXISTS (
+      SELECT 1
+      FROM /* TEMPLATE: schema */file_parts fp
+      WHERE fp.channel_id = receipt.channel_id
+        AND fp.message_id = receipt.message_id
+  );
+
+-- name: ListSupersededPublishedReceipts :many
+-- Published receipts whose part committed a different message (duplicate
+-- publishes after lease takeover); their own message is unreferenced.
+SELECT us.user_id AS user_id, r.*
+FROM /* TEMPLATE: schema */upload_part_receipts r
+JOIN /* TEMPLATE: schema */upload_sessions us ON us.id = r.upload_id
+JOIN /* TEMPLATE: schema */upload_parts p ON p.upload_id = r.upload_id AND p.part_no = r.part_no
+WHERE r.state = 'published'
+  AND r.message_id IS NOT NULL
+  AND p.state = 'stored'
+  AND p.message_id IS DISTINCT FROM r.message_id
+  AND NOT EXISTS (
+      SELECT 1
+      FROM /* TEMPLATE: schema */upload_parts up
+      WHERE up.channel_id = r.channel_id
+        AND up.message_id = r.message_id
+  )
+  AND NOT EXISTS (
+      SELECT 1
+      FROM /* TEMPLATE: schema */file_parts fp
+      WHERE fp.channel_id = r.channel_id
+        AND fp.message_id = r.message_id
+  )
+ORDER BY r.updated_at, r.upload_id, r.part_no
+LIMIT 1000;
+
+-- name: DeleteSupersededReceiptsForCleanup :execrows
+DELETE FROM /* TEMPLATE: schema */upload_part_receipts AS receipt
+USING /* TEMPLATE: schema */upload_parts AS part,
+      jsonb_to_recordset(sqlc.arg(receipts)::jsonb) AS cleanup_receipt(
+          upload_id uuid,
+          part_no integer,
+          lease_token uuid,
+          channel_id bigint,
+          message_id bigint
+      )
+WHERE receipt.upload_id = cleanup_receipt.upload_id
+  AND receipt.part_no = cleanup_receipt.part_no
+  AND receipt.lease_token = cleanup_receipt.lease_token
+  AND receipt.channel_id = cleanup_receipt.channel_id
+  AND receipt.message_id = cleanup_receipt.message_id
+  AND part.upload_id = receipt.upload_id
+  AND part.part_no = receipt.part_no
+  AND part.state = 'stored'
+  AND part.message_id IS DISTINCT FROM receipt.message_id
+  AND receipt.state = 'published'
+  AND NOT EXISTS (
+      SELECT 1
+      FROM /* TEMPLATE: schema */upload_parts up
+      WHERE up.channel_id = receipt.channel_id
+        AND up.message_id = receipt.message_id
+  )
+  AND NOT EXISTS (
+      SELECT 1
+      FROM /* TEMPLATE: schema */file_parts fp
+      WHERE fp.channel_id = receipt.channel_id
+        AND fp.message_id = receipt.message_id
+  );
+
+-- Committed-class row garbage collection: adopted receipts never require a
+-- remote delete. They are removed once the file is committed (file_parts is
+-- the durable reference) or their stored part row has already been cleaned.
+-- name: DeleteAdoptedReceipts :execrows
+WITH gone AS (
+    SELECT r.upload_id AS upload_id, r.part_no AS part_no, r.lease_token AS lease_token
+    FROM /* TEMPLATE: schema */upload_part_receipts r
+    JOIN /* TEMPLATE: schema */upload_sessions us ON us.id = r.upload_id
+    WHERE r.state = 'adopted'
+      AND (
+          us.state = 'completed'
+          OR NOT EXISTS (
+              SELECT 1
+              FROM /* TEMPLATE: schema */upload_parts up
+              WHERE up.upload_id = r.upload_id
+                AND up.part_no = r.part_no
+                AND up.channel_id = r.channel_id
+                AND up.message_id = r.message_id
+          )
+      )
+    LIMIT 1000
+)
+DELETE FROM /* TEMPLATE: schema */upload_part_receipts
+WHERE (upload_id, part_no, lease_token) IN (SELECT upload_id, part_no, lease_token FROM gone);

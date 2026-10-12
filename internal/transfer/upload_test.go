@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/tgdrive/teldrive/v2/internal/db/sqlcgen"
 	"github.com/tgdrive/teldrive/v2/internal/telegramstore"
@@ -237,6 +238,24 @@ func (c *leaseCatalog) GetPart(context.Context, int64, uuid.UUID, int32) (*sqlcg
 func (c *leaseCatalog) ClaimPart(context.Context, uploads.ClaimPartInput) (*uploads.ClaimPartResult, error) {
 	return &uploads.ClaimPartResult{Part: &sqlcgen.UploadPart{}, LeaseToken: c.leaseToken}, nil
 }
+func (*leaseCatalog) FindTakeablePart(context.Context, uploads.FindTakeableInput) (*uploads.Adoption, error) {
+	return nil, nil
+}
+func (*leaseCatalog) ClaimPartForAdoption(context.Context, uploads.ClaimAdoptionInput) (*uploads.ClaimPartResult, error) {
+	return nil, uploads.ErrAdoptionUnavailable
+}
+func (*leaseCatalog) RecordPartPublication(context.Context, uploads.RecordPublicationInput) error {
+	return nil
+}
+func (*leaseCatalog) AttachPartReceiptHashes(context.Context, uploads.AttachReceiptHashesInput) error {
+	return nil
+}
+func (*leaseCatalog) CondemnPartReceipt(context.Context, uploads.CondemnPartReceiptInput) (int64, error) {
+	return 0, nil
+}
+func (*leaseCatalog) DeletePartReceipt(context.Context, uploads.DeletePartReceiptInput) error {
+	return nil
+}
 func (c *leaseCatalog) RenewPart(context.Context, uploads.RenewPartInput) error {
 	c.mu.Lock()
 	c.renewals++
@@ -305,6 +324,24 @@ func (*cleanupCatalog) GetPart(context.Context, int64, uuid.UUID, int32) (*sqlcg
 func (*cleanupCatalog) ClaimPart(context.Context, uploads.ClaimPartInput) (*uploads.ClaimPartResult, error) {
 	return nil, errors.New("not used")
 }
+func (*cleanupCatalog) FindTakeablePart(context.Context, uploads.FindTakeableInput) (*uploads.Adoption, error) {
+	return nil, errors.New("not used")
+}
+func (*cleanupCatalog) ClaimPartForAdoption(context.Context, uploads.ClaimAdoptionInput) (*uploads.ClaimPartResult, error) {
+	return nil, errors.New("not used")
+}
+func (*cleanupCatalog) RecordPartPublication(context.Context, uploads.RecordPublicationInput) error {
+	return errors.New("not used")
+}
+func (*cleanupCatalog) AttachPartReceiptHashes(context.Context, uploads.AttachReceiptHashesInput) error {
+	return errors.New("not used")
+}
+func (*cleanupCatalog) CondemnPartReceipt(context.Context, uploads.CondemnPartReceiptInput) (int64, error) {
+	return 0, errors.New("not used")
+}
+func (*cleanupCatalog) DeletePartReceipt(context.Context, uploads.DeletePartReceiptInput) error {
+	return errors.New("not used")
+}
 func (*cleanupCatalog) RenewPart(context.Context, uploads.RenewPartInput) error {
 	return errors.New("not used")
 }
@@ -342,6 +379,149 @@ func (*deleteStorage) CreateChannel(context.Context, int64, string) (telegramsto
 	return telegramstore.Channel{}, errors.New("not used")
 }
 func (*deleteStorage) DeleteChannel(context.Context, int64, int64) error { return nil }
+
+type reconcileCatalog struct {
+	leaseToken   uuid.UUID
+	storeErrors  []error
+	storedPart   *sqlcgen.UploadPart
+	getPartErr   error
+	storeCalls   int
+	condemnedIDs []int64
+}
+
+func newReconcileCatalog() *reconcileCatalog {
+	return &reconcileCatalog{leaseToken: uuid.New(), getPartErr: uploads.ErrNotFound}
+}
+
+func (*reconcileCatalog) Get(context.Context, int64, uuid.UUID) (*sqlcgen.UploadSession, error) {
+	return &sqlcgen.UploadSession{}, nil
+}
+func (c *reconcileCatalog) GetPart(context.Context, int64, uuid.UUID, int32) (*sqlcgen.UploadPart, error) {
+	// Only surface the committed read-back after StorePart was attempted, so
+	// the pipeline's initial idempotent lookup still misses.
+	if c.storeCalls > 0 && c.storedPart != nil {
+		return c.storedPart, nil
+	}
+	return nil, c.getPartErr
+}
+func (c *reconcileCatalog) ClaimPart(context.Context, uploads.ClaimPartInput) (*uploads.ClaimPartResult, error) {
+	return &uploads.ClaimPartResult{Part: &sqlcgen.UploadPart{ChannelID: 9}, LeaseToken: c.leaseToken}, nil
+}
+func (*reconcileCatalog) FindTakeablePart(context.Context, uploads.FindTakeableInput) (*uploads.Adoption, error) {
+	return nil, nil
+}
+func (*reconcileCatalog) ClaimPartForAdoption(context.Context, uploads.ClaimAdoptionInput) (*uploads.ClaimPartResult, error) {
+	return nil, uploads.ErrAdoptionUnavailable
+}
+func (*reconcileCatalog) RecordPartPublication(context.Context, uploads.RecordPublicationInput) error {
+	return nil
+}
+func (*reconcileCatalog) AttachPartReceiptHashes(context.Context, uploads.AttachReceiptHashesInput) error {
+	return nil
+}
+func (c *reconcileCatalog) CondemnPartReceipt(_ context.Context, in uploads.CondemnPartReceiptInput) (int64, error) {
+	c.condemnedIDs = append(c.condemnedIDs, 0)
+	return 0, nil
+}
+func (*reconcileCatalog) DeletePartReceipt(context.Context, uploads.DeletePartReceiptInput) error {
+	return nil
+}
+func (*reconcileCatalog) RenewPart(context.Context, uploads.RenewPartInput) error { return nil }
+func (c *reconcileCatalog) StorePart(context.Context, uploads.StorePartInput) (*sqlcgen.UploadPart, error) {
+	c.storeCalls++
+	if c.storeCalls <= len(c.storeErrors) {
+		return nil, c.storeErrors[c.storeCalls-1]
+	}
+	return &sqlcgen.UploadPart{State: sqlcgen.UploadPartStateStored, MessageID: pgtype.Int8{Int64: 7, Valid: true}}, nil
+}
+func (*reconcileCatalog) FailPart(context.Context, uploads.FailPartInput) (*sqlcgen.UploadPart, error) {
+	return &sqlcgen.UploadPart{}, nil
+}
+
+type reconcileStorage struct {
+	deleted []int64
+}
+
+func (*reconcileStorage) Upload(_ context.Context, request telegramstore.UploadRequest) (telegramstore.StoredPart, error) {
+	data, err := io.ReadAll(request.Reader)
+	if err != nil {
+		return telegramstore.StoredPart{}, err
+	}
+	return telegramstore.StoredPart{ChannelID: request.ChannelID, MessageID: 7, Size: int64(len(data))}, nil
+}
+func (*reconcileStorage) OpenRange(context.Context, telegramstore.RangeRequest) (io.ReadCloser, error) {
+	return nil, errors.New("not used")
+}
+func (s *reconcileStorage) DeleteMessages(_ context.Context, _ int64, _ int64, ids []int64) error {
+	s.deleted = append(s.deleted, ids...)
+	return nil
+}
+func (*reconcileStorage) CopyPart(context.Context, int64, int64, int64, int64) (telegramstore.StoredPart, error) {
+	return telegramstore.StoredPart{}, errors.New("not used")
+}
+func (*reconcileStorage) CreateChannel(context.Context, int64, string) (telegramstore.Channel, error) {
+	return telegramstore.Channel{}, errors.New("not used")
+}
+func (*reconcileStorage) DeleteChannel(context.Context, int64, int64) error { return nil }
+
+func runReconcileUpload(t *testing.T, catalog *reconcileCatalog, storage telegramstore.Storage) (*UploadPartResult, error) {
+	t.Helper()
+	pipeline := NewPipeline(catalog, fixedChannelResolver(9), storage, nil, Config{})
+	return pipeline.UploadPart(context.Background(), UploadPartRequest{
+		UserID: 1, UploadID: uuid.New(), PartNo: 1, PlainSize: 4, Body: bytes.NewBufferString("data"),
+	})
+}
+
+func TestCommitPartAmbiguousCommitReadsOriginalResult(t *testing.T) {
+	t.Parallel()
+	catalog := newReconcileCatalog()
+	commitUnknown := errors.New("commit unknown")
+	catalog.storeErrors = []error{commitUnknown, commitUnknown}
+	catalog.storedPart = &sqlcgen.UploadPart{State: sqlcgen.UploadPartStateStored, ChannelID: 9, MessageID: pgtype.Int8{Int64: 7, Valid: true}}
+	storage := &reconcileStorage{}
+
+	result, err := runReconcileUpload(t, catalog, storage)
+	if err != nil {
+		t.Fatalf("UploadPart() error = %v", err)
+	}
+	if result.Part.State != sqlcgen.UploadPartStateStored || catalog.storeCalls != 2 {
+		t.Fatalf("result = %#v, calls = %d", result.Part, catalog.storeCalls)
+	}
+	if len(storage.deleted) != 0 {
+		t.Fatalf("deleted messages after ambiguous commit = %#v", storage.deleted)
+	}
+}
+
+func TestCommitPartHardErrorLeavesMessageAndReceipt(t *testing.T) {
+	t.Parallel()
+	catalog := newReconcileCatalog()
+	hard := errors.New("database down")
+	catalog.storeErrors = []error{hard, hard}
+	storage := &reconcileStorage{}
+
+	if _, err := runReconcileUpload(t, catalog, storage); !errors.Is(err, hard) {
+		t.Fatalf("UploadPart() error = %v, want hard error", err)
+	}
+	if len(storage.deleted) != 0 || len(catalog.condemnedIDs) != 0 {
+		t.Fatalf("hard error side effects deleted=%#v condemned=%d", storage.deleted, len(catalog.condemnedIDs))
+	}
+}
+
+func TestCommitPartStoredDifferentMessageIsNotClaimedAsResult(t *testing.T) {
+	t.Parallel()
+	catalog := newReconcileCatalog()
+	hard := errors.New("database down")
+	catalog.storeErrors = []error{hard, hard}
+	catalog.storedPart = &sqlcgen.UploadPart{State: sqlcgen.UploadPartStateStored, ChannelID: 9, MessageID: pgtype.Int8{Int64: 999, Valid: true}}
+	storage := &reconcileStorage{}
+
+	if _, err := runReconcileUpload(t, catalog, storage); err == nil {
+		t.Fatal("expected commit error when stored message differs")
+	}
+	if len(storage.deleted) != 0 {
+		t.Fatalf("different-message cleanup deleted = %#v", storage.deleted)
+	}
+}
 
 func TestNormalizeOptionalChecksum(t *testing.T) {
 	t.Parallel()
