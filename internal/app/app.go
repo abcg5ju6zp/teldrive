@@ -196,7 +196,7 @@ func New(ctx context.Context, cfg config.Config, dependencies Dependencies) (*Ap
 	if err != nil {
 		return nil, fmt.Errorf("create share service: %w", err)
 	}
-	healthService := health.NewService(dependencies.Version, pool)
+	healthService := health.NewService(dependencies.Version, pool, telegram.readiness)
 	jobRuntime, err := jobs.NewRuntimeWithServices(
 		pool, storage, cfg.Database.Schema, botService, secureCipher, cfg.Uploads.SessionTTL,
 		jobs.UploaderServices{Catalog: catalogService, Uploads: uploadService, Pipeline: uploadPipeline, ActiveKeyVersion: cfg.Encryption.ActiveKeyVersion, LocalImportRoots: cfg.Uploads.LocalImportRoots},

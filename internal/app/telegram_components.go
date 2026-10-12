@@ -14,6 +14,7 @@ import (
 	"github.com/tgdrive/teldrive/v2/internal/bots"
 	"github.com/tgdrive/teldrive/v2/internal/cache"
 	"github.com/tgdrive/teldrive/v2/internal/config"
+	"github.com/tgdrive/teldrive/v2/internal/health"
 	"github.com/tgdrive/teldrive/v2/internal/localtelegram"
 	"github.com/tgdrive/teldrive/v2/internal/logingateway"
 	"github.com/tgdrive/teldrive/v2/internal/secureblob"
@@ -26,6 +27,7 @@ type telegramComponents struct {
 	account         telegramstore.Account
 	storage         telegramstore.Storage
 	downloadClients *telegramstore.DownloadClientPool
+	readiness       health.Pinger
 }
 
 func buildLegacyBotVerifier(cfg config.Config, logger *slog.Logger) (bots.Verifier, error) {
@@ -83,6 +85,7 @@ func buildTelegramComponents(cfg config.Config, pool *pgxpool.Pool, cipher *secu
 		if err != nil {
 			return telegramComponents{}, fmt.Errorf("open local Telegram emulator: %w", err)
 		}
+		logRecoveryReport(logger, root, server.RecoveryReport())
 		runner, err := localtelegram.NewRunner(server)
 		if err != nil {
 			return telegramComponents{}, err
@@ -97,6 +100,7 @@ func buildTelegramComponents(cfg config.Config, pool *pgxpool.Pool, cipher *secu
 		}
 		return telegramComponents{
 			login: localTelegramLogin{}, verifier: localBotVerifier{}, account: account, storage: storage,
+			readiness: server,
 		}, nil
 
 	case "remote":
@@ -156,5 +160,35 @@ func buildTelegramComponents(cfg config.Config, pool *pgxpool.Pool, cipher *secu
 
 	default:
 		return telegramComponents{}, fmt.Errorf("unsupported Telegram backend %q", cfg.Telegram.Backend)
+	}
+}
+
+// logRecoveryReport surfaces startup reconciliation of the local Telegram
+// root: completed publishes are debug noise, but anything quarantined or
+// dropped means an operator may need to inspect the root.
+func logRecoveryReport(logger *slog.Logger, root string, report localtelegram.RecoveryReport) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	args := []any{
+		"root", root,
+		"replayed_commits", report.ReplayedCommits,
+		"discarded_uploads", report.DiscardedUploads,
+		"quarantined", len(report.Quarantined),
+		"dangling_references", len(report.DanglingReferences),
+	}
+	if report.UpgradedFrom > 0 {
+		args = append(args, "upgraded_from_version", report.UpgradedFrom)
+	}
+	if report.RestoredFromBackup {
+		args = append(args, "restored_from_backup", true)
+	}
+	switch {
+	case len(report.Quarantined) > 0 || len(report.DanglingReferences) > 0 || report.RestoredFromBackup:
+		logger.Warn("local Telegram root recovered with observable inconsistencies", args...)
+	case report.ReplayedCommits > 0 || report.DiscardedUploads > 0 || report.UpgradedFrom > 0:
+		logger.Info("local Telegram root recovered interrupted operations", args...)
+	default:
+		logger.Debug("local Telegram root is consistent", args...)
 	}
 }

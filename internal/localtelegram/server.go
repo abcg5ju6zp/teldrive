@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -21,20 +22,17 @@ import (
 	"github.com/tgdrive/teldrive/v2/internal/telegramstore"
 )
 
-const (
-	stateFileName    = "state.json"
-	uploadsDirName   = "uploads"
-	documentsDirName = "documents"
-)
-
 type Server struct {
-	root         string
-	statePath    string
-	uploadsDir   string
-	documentsDir string
+	root          string
+	statePath     string
+	uploadsDir    string
+	documentsDir  string
+	pendingDir    string
+	quarantineDir string
 
-	mu    sync.Mutex
-	state persistedState
+	mu     sync.Mutex
+	state  persistedState
+	report RecoveryReport
 }
 
 func Open(root string) (*Server, error) {
@@ -47,25 +45,19 @@ func Open(root string) (*Server, error) {
 		return nil, fmt.Errorf("resolve local Telegram root: %w", err)
 	}
 	server := &Server{
-		root:         root,
-		statePath:    filepath.Join(root, stateFileName),
-		uploadsDir:   filepath.Join(root, uploadsDirName),
-		documentsDir: filepath.Join(root, documentsDirName),
+		root:          root,
+		statePath:     filepath.Join(root, stateFileName),
+		uploadsDir:    filepath.Join(root, uploadsDirName),
+		documentsDir:  filepath.Join(root, documentsDirName),
+		pendingDir:    filepath.Join(root, pendingDirName),
+		quarantineDir: filepath.Join(root, quarantineDirName),
 	}
-	for _, dir := range []string{server.root, server.uploadsDir, server.documentsDir} {
+	for _, dir := range []string{server.root, server.uploadsDir, server.documentsDir, server.pendingDir, server.quarantineDir} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return nil, fmt.Errorf("create local Telegram directory %q: %w", dir, err)
 		}
 	}
-	state, err := loadState(server.statePath)
-	if err != nil {
-		return nil, err
-	}
-	server.state = state
-	if err := server.recoverUploads(); err != nil {
-		return nil, err
-	}
-	if err := saveState(server.statePath, server.state); err != nil {
+	if err := server.recover(); err != nil {
 		return nil, err
 	}
 	return server, nil
@@ -115,6 +107,8 @@ func (s *Server) handle(ctx context.Context, input bin.Encoder) (bin.Encoder, er
 		return s.getChannels(request), nil
 	case *tg.MessagesGetDialogsRequest:
 		return s.getDialogs(request), nil
+	case *tg.MessagesGetHistoryRequest:
+		return s.getHistory(request), nil
 	case *tg.UsersGetUsersRequest:
 		return s.getUsers(request), nil
 	case *tg.UploadSaveFilePartRequest:
@@ -209,41 +203,46 @@ func (s *Server) sendMedia(ctx context.Context, request *tg.MessagesSendMediaReq
 		return nil, fmt.Errorf("local Telegram channel %d does not exist", channelID)
 	}
 
+	messageID := s.state.NextMessageID
+	s.state.NextMessageID++
+	createdAt := int(time.Now().Unix())
+
 	var document documentRecord
 	switch media := request.Media.(type) {
 	case *tg.InputMediaUploadedDocument:
-		created, err := s.finalizeUpload(ctx, media)
+		created, err := s.finalizeUpload(ctx, media, channelID, messageID, createdAt)
 		if err != nil {
+			s.state.NextMessageID = messageID
 			return nil, err
 		}
 		document = created
 	case *tg.InputMediaDocument:
 		input, ok := media.ID.(*tg.InputDocument)
 		if !ok {
+			s.state.NextMessageID = messageID
 			return nil, fmt.Errorf("local Telegram document reference %T is not supported", media.ID)
 		}
 		stored, exists := s.state.Documents[documentKey(input.ID)]
 		if !exists || stored.AccessHash != input.AccessHash {
+			s.state.NextMessageID = messageID
 			return nil, fmt.Errorf("local Telegram document %d does not exist", input.ID)
 		}
 		document = stored
+		if err := s.commitMessage(channelID, messageID, document.ID, createdAt); err != nil {
+			s.state.NextMessageID = messageID
+			return nil, err
+		}
 	default:
+		s.state.NextMessageID = messageID
 		return nil, fmt.Errorf("local Telegram media %T is not supported", request.Media)
 	}
 
-	messageID := s.state.NextMessageID
-	s.state.NextMessageID++
 	message := messageRecord{
 		ChannelID:  channelID,
 		ID:         messageID,
 		DocumentID: document.ID,
-		CreatedAt:  int(time.Now().Unix()),
+		CreatedAt:  createdAt,
 	}
-	s.state.Messages[messageKey(channelID, messageID)] = message
-	if err := saveState(s.statePath, s.state); err != nil {
-		return nil, err
-	}
-
 	telegramMessage := s.telegramMessage(message)
 	return &tg.Updates{
 		Updates: []tg.UpdateClass{&tg.UpdateNewChannelMessage{Message: telegramMessage, Pts: messageID, PtsCount: 1}},
@@ -253,7 +252,17 @@ func (s *Server) sendMedia(ctx context.Context, request *tg.MessagesSendMediaReq
 	}, nil
 }
 
-func (s *Server) finalizeUpload(ctx context.Context, media *tg.InputMediaUploadedDocument) (documentRecord, error) {
+// finalizeUpload turns uploaded parts into a committed document message.
+//
+// The on-disk ordering is crash-safe:
+//  1. parts are assembled and hashed into pending/<id>.blob,
+//  2. a pending/<id>.json intent pins document/message IDs and metadata,
+//  3. the blob is published as documents/<id>.bin,
+//  4. state.json atomically commits document + message indexes.
+//
+// A restart at any point converges: intents are replayed, unpublished content
+// is quarantined, and confirmed messages are never republished.
+func (s *Server) finalizeUpload(ctx context.Context, media *tg.InputMediaUploadedDocument, channelID int64, messageID int, createdAt int) (documentRecord, error) {
 	fileID, parts, name, ok := inputFileDetails(media.File)
 	if !ok || parts <= 0 {
 		return documentRecord{}, fmt.Errorf("local Telegram input file %T is invalid", media.File)
@@ -269,10 +278,109 @@ func (s *Server) finalizeUpload(ctx context.Context, media *tg.InputMediaUploade
 
 	documentID := s.state.NextDocumentID
 	s.state.NextDocumentID++
-	destination := filepath.Join(s.documentsDir, fmt.Sprintf("%d.bin", documentID))
-	temp, err := os.CreateTemp(s.documentsDir, ".document-*.tmp")
+	stagedPath := filepath.Join(s.pendingDir, stagingBlobName(documentID))
+	intentPath := filepath.Join(s.pendingDir, fmt.Sprintf("%d.json", documentID))
+	installedPath := filepath.Join(s.documentsDir, fmt.Sprintf("%d.bin", documentID))
+	committed := false
+	defer func() {
+		if !committed {
+			// Live failure before the commit point: roll back durable
+			// artifacts and in-memory index changes so the running view
+			// matches the last committed view.
+			delete(s.state.Messages, messageKey(channelID, messageID))
+			delete(s.state.Documents, documentKey(documentID))
+			s.state.NextDocumentID = documentID
+			_ = os.Remove(intentPath)
+			_ = os.Remove(stagedPath)
+			_ = os.Remove(installedPath)
+			_ = syncDir(s.pendingDir)
+			_ = syncDir(s.documentsDir)
+			_ = os.RemoveAll(uploadDir)
+		}
+	}()
+
+	digest, size, err := s.assembleUpload(ctx, fileID, parts, stagedPath)
 	if err != nil {
-		return documentRecord{}, fmt.Errorf("create local Telegram document temp file: %w", err)
+		return documentRecord{}, err
+	}
+
+	mimeType := strings.TrimSpace(media.MimeType)
+	if mimeType == "" {
+		mimeType = "application/octet-stream"
+	}
+	if attributeName := filenameFromAttributes(media.Attributes); attributeName != "" {
+		name = attributeName
+	}
+	record := documentRecord{
+		ID:            documentID,
+		AccessHash:    documentID + 1_000_000,
+		FileReference: []byte(digest),
+		MimeType:      mimeType,
+		Size:          size,
+		DCID:          1,
+		FileName:      name,
+		CreatedAt:     createdAt,
+	}
+	commit := pendingCommit{
+		Version:      stateVersion,
+		ChannelID:    channelID,
+		MessageID:    messageID,
+		UploadFileID: fileID,
+		UploadParts:  parts,
+		Document:     record,
+		CreatedAt:    createdAt,
+	}
+	payload, err := json.MarshalIndent(commit, "", "  ")
+	if err != nil {
+		return documentRecord{}, fmt.Errorf("encode local Telegram publish intent: %w", err)
+	}
+	// Intent must not appear before the staged blob it describes is durable.
+	if err := writeAtomicFile(intentPath, append(payload, '\n'), 0o600); err != nil {
+		return documentRecord{}, fmt.Errorf("write local Telegram publish intent: %w", err)
+	}
+	if err := replaceFile(stagedPath, installedPath); err != nil {
+		return documentRecord{}, fmt.Errorf("publish local Telegram document: %w", err)
+	}
+
+	s.state.Documents[documentKey(documentID)] = record
+	s.state.Messages[messageKey(channelID, messageID)] = messageRecord{
+		ChannelID:  channelID,
+		ID:         messageID,
+		DocumentID: documentID,
+		CreatedAt:  createdAt,
+	}
+	if err := saveState(s.statePath, s.state); err != nil {
+		return documentRecord{}, err
+	}
+	if err := s.removePublishArtifacts(commit); err != nil {
+		return documentRecord{}, err
+	}
+	committed = true
+	return record, nil
+}
+
+// commitMessage appends a message for an already-committed document (used by
+// document copies) and persists the index atomically.
+func (s *Server) commitMessage(channelID int64, messageID int, documentID int64, createdAt int) error {
+	s.state.Messages[messageKey(channelID, messageID)] = messageRecord{
+		ChannelID:  channelID,
+		ID:         messageID,
+		DocumentID: documentID,
+		CreatedAt:  createdAt,
+	}
+	if err := saveState(s.statePath, s.state); err != nil {
+		delete(s.state.Messages, messageKey(channelID, messageID))
+		return err
+	}
+	return nil
+}
+
+// assembleUpload concatenates numbered upload parts into stagedPath,
+// returning the hex SHA-256 digest and total size.
+func (s *Server) assembleUpload(ctx context.Context, fileID int64, parts int, stagedPath string) (string, int64, error) {
+	temp, err := os.CreateTemp(s.pendingDir, stagedTempPrefix+"*.tmp")
+	if err != nil {
+		return "", 0, fmt.Errorf("create local Telegram staged document: %w", err)
 	}
 	tempName := temp.Name()
 	cleanup := true
@@ -283,62 +391,60 @@ func (s *Server) finalizeUpload(ctx context.Context, media *tg.InputMediaUploade
 		}
 	}()
 
+	uploadDir := filepath.Join(s.uploadsDir, fmt.Sprintf("%d", fileID))
 	hash := sha256.New()
 	writer := io.MultiWriter(temp, hash)
 	var size int64
 	for part := range parts {
 		if err := ctx.Err(); err != nil {
-			return documentRecord{}, err
+			return "", 0, err
 		}
-		partPath := filepath.Join(uploadDir, fmt.Sprintf("%08d.part", part))
-		partFile, err := os.Open(partPath)
+		partFile, err := os.Open(filepath.Join(uploadDir, fmt.Sprintf("%08d.part", part)))
 		if err != nil {
-			return documentRecord{}, fmt.Errorf("open local Telegram upload part %d: %w", part, err)
+			return "", 0, fmt.Errorf("open local Telegram upload part %d: %w", part, err)
 		}
 		written, copyErr := io.Copy(writer, partFile)
 		closeErr := partFile.Close()
 		if copyErr != nil {
-			return documentRecord{}, fmt.Errorf("copy local Telegram upload part %d: %w", part, copyErr)
+			return "", 0, fmt.Errorf("copy local Telegram upload part %d: %w", part, copyErr)
 		}
 		if closeErr != nil {
-			return documentRecord{}, fmt.Errorf("close local Telegram upload part %d: %w", part, closeErr)
+			return "", 0, fmt.Errorf("close local Telegram upload part %d: %w", part, closeErr)
 		}
 		size += written
 	}
 	if err := temp.Sync(); err != nil {
-		return documentRecord{}, fmt.Errorf("sync local Telegram document: %w", err)
+		return "", 0, fmt.Errorf("sync local Telegram staged document: %w", err)
 	}
 	if err := temp.Close(); err != nil {
-		return documentRecord{}, fmt.Errorf("close local Telegram document: %w", err)
+		return "", 0, fmt.Errorf("close local Telegram staged document: %w", err)
 	}
-	if err := os.Rename(tempName, destination); err != nil {
-		return documentRecord{}, fmt.Errorf("publish local Telegram document: %w", err)
+	if err := os.Rename(tempName, stagedPath); err != nil {
+		return "", 0, fmt.Errorf("stage local Telegram document: %w", err)
+	}
+	if err := syncDir(s.pendingDir); err != nil {
+		return "", 0, err
 	}
 	cleanup = false
-	if err := os.RemoveAll(uploadDir); err != nil {
-		return documentRecord{}, fmt.Errorf("remove local Telegram upload parts: %w", err)
-	}
+	return hex.EncodeToString(hash.Sum(nil)), size, nil
+}
 
-	mimeType := strings.TrimSpace(media.MimeType)
-	if mimeType == "" {
-		mimeType = "application/octet-stream"
+// assembleFromParts rebuilds stagedPath from the upload parts captured by a
+// publish intent during startup recovery.
+func (s *Server) assembleFromParts(commit pendingCommit, stagedPath string) error {
+	_, _, err := s.assembleUpload(context.Background(), commit.UploadFileID, commit.UploadParts, stagedPath)
+	if err != nil {
+		return err
 	}
-	if attributeName := filenameFromAttributes(media.Attributes); attributeName != "" {
-		name = attributeName
+	digest, size, err := hashFile(stagedPath)
+	if err != nil {
+		return err
 	}
-	reference := []byte(hex.EncodeToString(hash.Sum(nil)))
-	record := documentRecord{
-		ID:            documentID,
-		AccessHash:    documentID + 1_000_000,
-		FileReference: reference,
-		MimeType:      mimeType,
-		Size:          size,
-		DCID:          1,
-		FileName:      name,
-		CreatedAt:     int(time.Now().Unix()),
+	if size != commit.Document.Size || digest != documentHash(commit.Document) {
+		_ = os.Remove(stagedPath)
+		return fmt.Errorf("rebuilt document %d does not match intent", commit.Document.ID)
 	}
-	s.state.Documents[documentKey(documentID)] = record
-	return record, nil
+	return nil
 }
 
 func (s *Server) getMessages(request *tg.ChannelsGetMessagesRequest) *tg.MessagesMessages {
@@ -404,10 +510,14 @@ func (s *Server) deleteMessages(request *tg.ChannelsDeleteMessagesRequest) (bin.
 	for _, messageID := range request.ID {
 		delete(s.state.Messages, messageKey(channelID, messageID))
 	}
-	if err := s.garbageCollectDocuments(); err != nil {
+	// Commit the index before unlinking blobs: a crash in between leaves
+	// unreferenced files, which startup quarantines, never dangling index
+	// entries pointing at missing files.
+	blobPaths := s.detachUnreferencedDocuments()
+	if err := saveState(s.statePath, s.state); err != nil {
 		return nil, err
 	}
-	if err := saveState(s.statePath, s.state); err != nil {
+	if err := removeDocumentBlobs(s.documentsDir, blobPaths); err != nil {
 		return nil, err
 	}
 	return &tg.MessagesAffectedMessages{Pts: s.state.NextMessageID, PtsCount: len(request.ID)}, nil
@@ -444,13 +554,90 @@ func (s *Server) deleteChannel(request *tg.ChannelsDeleteChannelRequest) (bin.En
 			delete(s.state.Messages, key)
 		}
 	}
-	if err := s.garbageCollectDocuments(); err != nil {
-		return nil, err
-	}
+	blobPaths := s.detachUnreferencedDocuments()
 	if err := saveState(s.statePath, s.state); err != nil {
 		return nil, err
 	}
+	if err := removeDocumentBlobs(s.documentsDir, blobPaths); err != nil {
+		return nil, err
+	}
 	return &tg.Updates{Date: int(time.Now().Unix()), Seq: s.state.NextMessageID}, nil
+}
+
+// detachUnreferencedDocuments removes documents that no longer have a message
+// reference from the in-memory index, returning the blob paths that may be
+// unlinked after the index commit lands.
+func (s *Server) detachUnreferencedDocuments() []string {
+	referenced := make(map[int64]struct{}, len(s.state.Messages))
+	for _, message := range s.state.Messages {
+		referenced[message.DocumentID] = struct{}{}
+	}
+	paths := make([]string, 0)
+	for key, document := range s.state.Documents {
+		if _, ok := referenced[document.ID]; ok {
+			continue
+		}
+		paths = append(paths, filepath.Join(s.documentsDir, fmt.Sprintf("%d.bin", document.ID)))
+		delete(s.state.Documents, key)
+	}
+	return paths
+}
+
+// removeDocumentBlobs unlinks already-detached document blobs after their
+// index commit. Missing files are expected from retried deletes.
+func removeDocumentBlobs(documentsDir string, paths []string) error {
+	for _, path := range paths {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove local Telegram document: %w", err)
+		}
+	}
+	if len(paths) > 0 {
+		if err := syncDir(documentsDir); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// getHistory serves messages.getHistory for storage maintenance traversal.
+// Results are ordered by message ID descending, strictly older than
+// OffsetID, matching the pagination contract used by the orphan cleanup.
+func (s *Server) getHistory(request *tg.MessagesGetHistoryRequest) *tg.MessagesChannelMessages {
+	channelID, ok := inputPeerChannelID(request.Peer)
+	response := &tg.MessagesChannelMessages{}
+	if !ok {
+		return response
+	}
+	channel, exists := s.state.Channels[channelKey(channelID)]
+	if !exists {
+		return response
+	}
+	ids := make([]int, 0)
+	for _, message := range s.state.Messages {
+		if message.ChannelID != channelID {
+			continue
+		}
+		if request.OffsetID > 0 && message.ID >= request.OffsetID {
+			continue
+		}
+		ids = append(ids, message.ID)
+	}
+	slices.SortFunc(ids, func(a, b int) int { return cmp.Compare(b, a) })
+	limit := request.Limit
+	if limit <= 0 || limit > 100 {
+		limit = 100
+	}
+	response.Count = len(ids)
+	if len(ids) > limit {
+		ids = ids[:limit]
+	}
+	messages := make([]tg.MessageClass, 0, len(ids))
+	for _, id := range ids {
+		messages = append(messages, s.telegramMessage(s.state.Messages[messageKey(channelID, id)]))
+	}
+	response.Messages = messages
+	response.Chats = []tg.ChatClass{telegramChannel(channel)}
+	return response
 }
 
 func (s *Server) telegramMessage(record messageRecord) *tg.Message {
@@ -465,37 +652,51 @@ func (s *Server) telegramMessage(record messageRecord) *tg.Message {
 	}
 }
 
-func (s *Server) garbageCollectDocuments() error {
-	referenced := make(map[int64]struct{}, len(s.state.Messages))
-	for _, message := range s.state.Messages {
-		referenced[message.DocumentID] = struct{}{}
+// Ping implements the readiness contract: the committed index must parse at
+// the supported version and every managed directory must be present.
+func (s *Server) Ping(ctx context.Context) error {
+	if s == nil {
+		return errors.New("local Telegram server is not configured")
 	}
-	for key, document := range s.state.Documents {
-		if _, ok := referenced[document.ID]; ok {
-			continue
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	data, err := os.ReadFile(s.statePath)
+	if err != nil {
+		return fmt.Errorf("read local Telegram state: %w", err)
+	}
+	state, err := decodeState(data)
+	if err != nil {
+		return fmt.Errorf("decode local Telegram state: %w", err)
+	}
+	if err := validateVersion(state); err != nil {
+		return err
+	}
+	for _, dir := range []string{s.uploadsDir, s.documentsDir, s.pendingDir, s.quarantineDir} {
+		info, err := os.Stat(dir)
+		if err != nil {
+			return fmt.Errorf("local Telegram directory %q is unavailable: %w", filepath.Base(dir), err)
 		}
-		if err := os.Remove(filepath.Join(s.documentsDir, fmt.Sprintf("%d.bin", document.ID))); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("remove local Telegram document: %w", err)
+		if !info.IsDir() {
+			return fmt.Errorf("local Telegram path %q is not a directory", filepath.Base(dir))
 		}
-		delete(s.state.Documents, key)
 	}
 	return nil
 }
 
-func (s *Server) recoverUploads() error {
-	entries, err := os.ReadDir(s.uploadsDir)
-	if err != nil {
-		return fmt.Errorf("read local Telegram uploads: %w", err)
+// RecoveryReport summarizes the last startup reconciliation.
+func (s *Server) RecoveryReport() RecoveryReport {
+	if s == nil {
+		return RecoveryReport{}
 	}
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		if err := os.RemoveAll(filepath.Join(s.uploadsDir, entry.Name())); err != nil {
-			return fmt.Errorf("remove incomplete local Telegram upload %q: %w", entry.Name(), err)
-		}
-	}
-	return nil
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	report := s.report
+	report.Quarantined = append([]QuarantineEntry(nil), s.report.Quarantined...)
+	report.DanglingReferences = append([]DanglingReference(nil), s.report.DanglingReferences...)
+	return report
 }
 
 func telegramChannel(record channelRecord) *tg.Channel {
